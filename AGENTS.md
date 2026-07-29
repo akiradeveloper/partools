@@ -5,7 +5,7 @@ GPU並列アルゴリズムライブラリの開発を行う。
 ## 構成
 
 - massively: ライブラリ本体
-- verification: Massivelyの検証
+- oracle: CPU参照実装とpropertyテストによるMassivelyの検証
 
 ## 注意
 

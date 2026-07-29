@@ -1,16 +1,21 @@
 //! Recursive output trees and physical storage staging.
 
 use core::marker::PhantomData;
-use cubecl::prelude::{ComputeClient, Runtime};
-use std::ops::RangeBounds;
+use cubecl::prelude::Runtime;
 
-use crate::storage::{Concat, FlatLeaves, FlatRow, JoinedRow};
-use crate::{
-    Column, ColumnMut, DeviceSliceMut, Error, MStorageElement, S1, S2, S3, S4, S5, S6, S7, S8, S9,
-    S10, S11, S12, StorageLayout, Zip,
-    read::{Env0, Env1, Env2, Env3, Env4, Env5, Env6, Env7, Env8, Env9, Env10, Env11, Env12},
-    storage::StorageArity,
+use crate::core::bindings::Bindings;
+use crate::core::iter::Zip;
+use crate::core::read::{
+    Column, Env0, Env1, Env2, Env3, Env4, Env5, Env6, Env7, Env8, Env9, Env10, Env11, Env12,
 };
+use crate::core::runtime::ColumnMut;
+use crate::core::storage::{
+    Concat, FlatLeaves, FlatRow, JoinedRow, S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12,
+    StorageArity, StorageLayout,
+};
+use crate::core::value::MStorageElement;
+use crate::{DeviceSliceMut, Error};
+use std::ops::RangeBounds;
 
 /// A zero-copy mutable subrange tied to the runtime selected by `MIterMut`.
 #[derive(Clone, Copy, Debug)]
@@ -39,8 +44,8 @@ where
     type Item = Output::Item;
     type StorageArity = Output::StorageArity;
 
-    fn logical_len(&self) -> Result<usize, Error> {
-        self.output.logical_len()
+    fn physical_len(&self) -> Result<usize, Error> {
+        self.output.physical_len()
     }
 }
 
@@ -57,10 +62,10 @@ impl<R, Output> ReadOutput for Slice<R, Output>
 where
     Output: ReadOutput,
 {
-    type Read = crate::read::Slice<R, Output::Read>;
+    type Read = crate::core::read::Slice<R, Output::Read>;
 
     fn slice_read<Range: RangeBounds<usize>>(&self, range: Range) -> Self::Read {
-        crate::read::Slice::new(self.output.slice_read(range))
+        crate::core::read::Slice::new(self.output.slice_read(range))
     }
 }
 
@@ -69,7 +74,8 @@ pub trait OutputExpression {
     type Item: StorageLayout;
     type StorageArity: StorageArity;
 
-    fn logical_len(&self) -> Result<usize, Error>;
+    /// Number of rows available in the preallocated destination.
+    fn physical_len(&self) -> Result<usize, Error>;
 }
 
 /// Creates same-shaped subviews of a recursive output tree.
@@ -80,7 +86,7 @@ pub trait SliceOutput: OutputExpression + Sized {
 /// Creates a read-only view over a mutable output tree.
 #[doc(hidden)]
 pub trait ReadOutput: OutputExpression {
-    type Read: crate::read::ReadExpression<Item = Self::Item>;
+    type Read: crate::core::read::ReadExpression<Item = Self::Item>;
 
     fn slice_read<Range: RangeBounds<usize>>(&self, range: Range) -> Self::Read;
 }
@@ -101,7 +107,7 @@ where
     type Item = T;
     type StorageArity = S1;
 
-    fn logical_len(&self) -> Result<usize, Error> {
+    fn physical_len(&self) -> Result<usize, Error> {
         Ok(self.len)
     }
 }
@@ -135,7 +141,7 @@ where
     type Item = T;
     type StorageArity = S1;
 
-    fn logical_len(&self) -> Result<usize, Error> {
+    fn physical_len(&self) -> Result<usize, Error> {
         Ok(self.output.len)
     }
 }
@@ -168,9 +174,9 @@ where
     type Item = JoinedRow<Left::Item, Right::Item>;
     type StorageArity = <Self::Item as StorageLayout>::StorageArity;
 
-    fn logical_len(&self) -> Result<usize, Error> {
-        let left = self.0.logical_len()?;
-        let right = self.1.logical_len()?;
+    fn physical_len(&self) -> Result<usize, Error> {
+        let left = self.0.physical_len()?;
+        let right = self.1.physical_len()?;
         if left != right {
             return Err(Error::LengthMismatch { left, right });
         }
@@ -186,9 +192,9 @@ where
 {
     fn slice_output<Range: RangeBounds<usize>>(&self, range: Range) -> Self {
         let len = self
-            .logical_len()
+            .physical_len()
             .expect("output columns have equal lengths");
-        let (start, count) = crate::read::resolve_slice_range(len, range);
+        let (start, count) = crate::core::read::resolve_slice_range(len, range);
         Zip::new(
             self.0.slice_output(start..start + count),
             self.1.slice_output(start..start + count),
@@ -202,15 +208,15 @@ where
     Right: ReadOutput,
     Zip<Left, Right>: OutputExpression,
     Zip<Left::Read, Right::Read>:
-        crate::read::ReadExpression<Item = <Zip<Left, Right> as OutputExpression>::Item>,
+        crate::core::read::ReadExpression<Item = <Zip<Left, Right> as OutputExpression>::Item>,
 {
     type Read = Zip<Left::Read, Right::Read>;
 
     fn slice_read<Range: RangeBounds<usize>>(&self, range: Range) -> Self::Read {
         let len = self
-            .logical_len()
+            .physical_len()
             .expect("output columns have equal lengths");
-        let (start, count) = crate::read::resolve_slice_range(len, range);
+        let (start, count) = crate::core::read::resolve_slice_range(len, range);
         Zip::new(
             self.0.slice_read(start..start + count),
             self.1.slice_read(start..start + count),
@@ -282,30 +288,30 @@ pub trait OutputSlotEnvironment {
 /// and are never accessed by device-side padded stores.
 #[doc(hidden)]
 pub trait PaddedOutputSlots: OutputSlotEnvironment {
-    type Leaves: crate::storage::StorePadded12;
+    type Leaves: crate::core::storage::StorePadded12;
 }
 
 /// Maps an ordered physical leaf list back to its actual (unpadded) output
 /// slot environment.
 #[doc(hidden)]
-pub trait OutputSlotLayout: crate::storage::StorePadded12 {
+pub trait OutputSlotLayout: crate::core::storage::StorePadded12 {
     type Slots: PaddedOutputSlots<Leaves = Self>;
 }
 
 #[doc(hidden)]
 pub type KernelOutputSlots<Slots> = Env12<
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O0,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O1,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O2,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O3,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O4,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O5,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O6,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O7,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O8,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O9,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O10,
-    <<Slots as PaddedOutputSlots>::Leaves as crate::storage::StorePadded12>::O11,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O0,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O1,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O2,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O3,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O4,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O5,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O6,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O7,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O8,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O9,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O10,
+    <<Slots as PaddedOutputSlots>::Leaves as crate::core::storage::StorePadded12>::O11,
 >;
 
 macro_rules! impl_padded_output_slots {
@@ -320,9 +326,9 @@ macro_rules! impl_padded_output_slots {
             type Slots = $env;
         }
     };
-    (@leaves $last:ty) => { crate::storage::Last<$last> };
+    (@leaves $last:ty) => { crate::core::storage::Last<$last> };
     (@leaves $head:ty, $($tail:ty),+) => {
-        crate::storage::More<$head, impl_padded_output_slots!(@leaves $($tail),+)>
+        crate::core::storage::More<$head, impl_padded_output_slots!(@leaves $($tail),+)>
     };
 }
 
@@ -402,44 +408,10 @@ where
     type Slots = Output::NextEnv;
 }
 
-#[doc(hidden)]
-pub struct OutputBindings {
-    pub(crate) slots: Vec<(cubecl::server::Handle, usize)>,
-    pub(crate) offsets: Vec<u32>,
-}
-
-impl OutputBindings {
-    pub(crate) fn new() -> Self {
-        Self {
-            slots: Vec::new(),
-            offsets: Vec::new(),
-        }
-    }
-
-    pub(crate) fn push(&mut self, handle: cubecl::server::Handle, len: usize, offset: u32) {
-        self.slots.push((handle, len));
-        self.offsets.push(offset);
-    }
-
-    /// Pads the launch ABI to twelve writable buffers. One four-byte dummy
-    /// allocation is shared by every inactive slot; padded device stores never
-    /// access those slots.
-    pub(crate) fn pad_to_twelve<R: Runtime>(&mut self, client: &ComputeClient<R>) {
-        debug_assert!(self.slots.len() <= 12);
-        if self.slots.len() == 12 {
-            return;
-        }
-        let dummy = client.empty(core::mem::size_of::<u32>());
-        while self.slots.len() < 12 {
-            self.push(dummy.clone(), 1, 0);
-        }
-    }
-}
-
 /// Stages output buffers using the same left-first traversal as storage layout.
 #[doc(hidden)]
 pub trait StageOutput<R: Runtime, Env>: BindOutputSlots<Env> {
-    fn stage_output(&self, owner: u64, bindings: &mut OutputBindings) -> Result<(), Error>;
+    fn stage_output(&self, owner: u64, bindings: &mut Bindings) -> Result<(), Error>;
 }
 
 impl<R, T, Env> StageOutput<R, Env> for DeviceSliceMut<R, T>
@@ -450,46 +422,25 @@ where
     DeviceSliceMut<R, T>:
         BindOutputSlots<Env, NextEnv = <ColumnMut<T> as BindOutputSlots<Env>>::NextEnv>,
 {
-    fn stage_output(&self, owner: u64, bindings: &mut OutputBindings) -> Result<(), Error> {
+    fn stage_output(&self, owner: u64, bindings: &mut Bindings) -> Result<(), Error> {
         self.output.stage_output(owner, bindings)
     }
 }
 
-macro_rules! impl_output_leaf_staging {
-    (impl <$( $env_ty:ident ),*> $env:ty) => {
-        impl<R, T, $( $env_ty ),*> StageOutput<R, $env> for ColumnMut<T>
-        where
-            R: Runtime,
-            T: MStorageElement,
-            ColumnMut<T>: BindOutputSlots<$env>,
-        {
-            fn stage_output(
-                &self,
-                owner: u64,
-                bindings: &mut OutputBindings,
-            ) -> Result<(), Error> {
-                if self.owner != owner {
-                    return Err(Error::ForeignExecutor);
-                }
-                bindings.push(self.handle.clone(), self.buffer_len, self.offset);
-                Ok(())
-            }
+impl<R, T, Env> StageOutput<R, Env> for ColumnMut<T>
+where
+    R: Runtime,
+    T: MStorageElement,
+    ColumnMut<T>: BindOutputSlots<Env>,
+{
+    fn stage_output(&self, owner: u64, bindings: &mut Bindings) -> Result<(), Error> {
+        if self.owner != owner {
+            return Err(Error::ForeignExecutor);
         }
-    };
+        bindings.push(self.handle.clone(), self.buffer_len, self.offset);
+        Ok(())
+    }
 }
-
-impl_output_leaf_staging!(impl <> Env0);
-impl_output_leaf_staging!(impl <L0> Env1<L0>);
-impl_output_leaf_staging!(impl <L0, L1> Env2<L0, L1>);
-impl_output_leaf_staging!(impl <L0, L1, L2> Env3<L0, L1, L2>);
-impl_output_leaf_staging!(impl <L0, L1, L2, L3> Env4<L0, L1, L2, L3>);
-impl_output_leaf_staging!(impl <L0, L1, L2, L3, L4> Env5<L0, L1, L2, L3, L4>);
-impl_output_leaf_staging!(impl <L0, L1, L2, L3, L4, L5> Env6<L0, L1, L2, L3, L4, L5>);
-impl_output_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6> Env7<L0, L1, L2, L3, L4, L5, L6>);
-impl_output_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6, L7> Env8<L0, L1, L2, L3, L4, L5, L6, L7>);
-impl_output_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6, L7, L8> Env9<L0, L1, L2, L3, L4, L5, L6, L7, L8>);
-impl_output_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9> Env10<L0, L1, L2, L3, L4, L5, L6, L7, L8, L9>);
-impl_output_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10> Env11<L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10>);
 
 impl<R, Left, Right, Env> StageOutput<R, Env> for Zip<Left, Right>
 where
@@ -498,7 +449,7 @@ where
     Right: StageOutput<R, Left::NextEnv>,
     Zip<Left, Right>: BindOutputSlots<Env>,
 {
-    fn stage_output(&self, owner: u64, bindings: &mut OutputBindings) -> Result<(), Error> {
+    fn stage_output(&self, owner: u64, bindings: &mut Bindings) -> Result<(), Error> {
         self.0.stage_output(owner, bindings)?;
         self.1.stage_output(owner, bindings)
     }
@@ -510,7 +461,7 @@ where
     Output: StageOutput<R, Env>,
     Slice<R, Output>: BindOutputSlots<Env>,
 {
-    fn stage_output(&self, owner: u64, bindings: &mut OutputBindings) -> Result<(), Error> {
+    fn stage_output(&self, owner: u64, bindings: &mut Bindings) -> Result<(), Error> {
         self.output.stage_output(owner, bindings)
     }
 }

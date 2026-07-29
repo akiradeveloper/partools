@@ -2,74 +2,34 @@
 
 #![allow(private_interfaces)]
 
-use core::marker::PhantomData;
 use cubecl::prelude::*;
 
-use crate::allocation::CopyStorage;
-use crate::{
-    A13, Column, Constant, Counting, DivModCounting, Error, Executor, MStorageElement, Permute,
-    ReadExpression, ReverseCounting, RowStorage, S12, StorageLayout, Stride, Taken, Transform, Zip,
-    eval::Eval13,
-    launch::cube_count_1d,
-    op::UnaryOp,
-    output::OutputBindings,
-    read::{
-        BindSlots, Env0, Env1, Env2, Env3, Env4, Env5, Env6, Env7, Env8, Env9, Env10, Env11, Env12,
-        Env13, LowerReadExpression, PaddedReadSlots, TakenSource,
-    },
-    storage::{
-        Decompose, MutableLeaves, MutableLeavesExpand, PlaneShuffleLeaves, Recompose, SharedLeaves,
-        SharedLeavesExpand, StorePadded12, StorePadded12Expand,
-    },
+use crate::core::allocation::RowStorage;
+use crate::core::arity::{A13, Dispatch};
+use crate::core::bindings::Bindings;
+use crate::core::eval::Eval13;
+use crate::core::launch::cube_count_1d;
+use crate::core::op::ReductionOp;
+use crate::core::read::{
+    Env0, Env12, Env13, LowerReadExpression, PaddedReadSlots, ReadExpression, StageRead,
 };
+use crate::core::storage::{
+    Decompose, LoadMutPadded12, MutableLeaves, MutableLeavesExpand, PlaneShuffleLeaves, Recompose,
+    S12, SharedLeaves, SharedLeavesExpand, StorageLayout, StorePadded12, StorePadded12Expand,
+};
+use crate::core::value::MStorageElement;
+use crate::{Error, Executor};
 
 type FixedReduceStorage<R, Item> = <Item as crate::core::allocation::ScratchStorage<R>>::Storage;
-type FixedReduceRead<R, Item> =
-    crate::read::FixedRead<<FixedReduceStorage<R, Item> as crate::RowStorage<R>>::Read>;
-type FixedReduceOutput<R, Item> = <FixedReduceStorage<R, Item> as crate::RowStorage<R>>::Write;
+type FixedReduceRead<R, Item> = crate::core::read::FixedRead<
+    <FixedReduceStorage<R, Item> as crate::core::allocation::RowStorage<R>>::Read,
+>;
+type FixedReduceOutput<R, Item> =
+    <FixedReduceStorage<R, Item> as crate::core::allocation::RowStorage<R>>::Write;
 
 const BLOCK_SIZE: u32 = 256;
-const ITEMS_PER_UNIT: usize = 256;
+const ITEMS_PER_UNIT: usize = 32;
 const TILE_SIZE: usize = BLOCK_SIZE as usize * ITEMS_PER_UNIT;
-
-/// Associative binary operation used by scans and reductions.
-///
-/// Scans preserve operand order. Reductions may regroup and reorder operands
-/// across GPU units, so operations passed to `reduce` must also be commutative.
-///
-/// # Examples
-///
-/// ```
-/// use cubecl::prelude::*;
-/// use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-/// use massively::{Executor, op, vector::reduce};
-///
-/// struct Add;
-///
-/// #[cubecl::cube]
-/// impl op::ReductionOp<u32> for Add {
-///     fn apply(lhs: u32, rhs: u32) -> u32 {
-///         lhs + rhs
-///     }
-/// }
-///
-/// let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
-/// let input = exec.to_device(&[1_u32, 2, 3]);
-///
-/// let init = 0_u32;
-/// let sum = reduce(&exec, input.slice(..), init, Add).unwrap();
-/// assert_eq!(sum, 6);
-/// ```
-#[cubecl::cube]
-pub trait ReductionOp<Item: CubeType>: 'static + Send + Sync {
-    fn apply(lhs: Item, rhs: Item) -> Item;
-}
-
-/// Semantic items supported by the first single-leaf reduction slice.
-
-/// Dispatch key combining read arity and reduction storage arity.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Dispatch<Read, Storage>(PhantomData<fn() -> (Read, Storage)>);
 
 #[cubecl::cube]
 fn accumulate_register<Item, Leaves, Layout, Op>(cells: &Leaves::Cells, value: Item)
@@ -139,527 +99,20 @@ where
     (Leaves::read(&cells), cell_valid.read())
 }
 
-#[doc(hidden)]
-pub struct StagedBindings {
-    pub(crate) slots: Vec<(cubecl::server::Handle, usize)>,
-    pub(crate) offsets: Vec<u32>,
-}
-
-impl StagedBindings {
-    pub(crate) fn new() -> Self {
-        Self {
-            slots: Vec::new(),
-            offsets: Vec::new(),
-        }
-    }
-
-    fn push(&mut self, handle: cubecl::server::Handle, len: usize, offset: u32) {
-        self.slots.push((handle, len));
-        self.offsets.push(offset);
-    }
-
-    /// Pads the staged read ABI to thirteen buffers. The shared dummy buffer
-    /// is never indexed by expressions whose corresponding slots are unused.
-    pub(crate) fn pad_to_thirteen<R: Runtime>(&mut self, client: &ComputeClient<R>) {
-        debug_assert!(self.slots.len() <= 13);
-        if self.slots.len() == 13 {
-            return;
-        }
-        let dummy = client.empty(core::mem::size_of::<u32>());
-        while self.slots.len() < 13 {
-            self.slots.push((dummy.clone(), 1));
-            self.offsets.push(0);
-        }
-    }
-}
-
-/// Host-side staging following the same left-first recursion as [`BindSlots`].
-#[doc(hidden)]
-pub trait StageRead<R: Runtime, Env>: BindSlots<Env> {
-    fn logical_len(&self) -> Result<usize, Error>;
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        Ok(crate::extent::LogicalExtent::fixed(self.logical_len()?))
-    }
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error>;
-}
-
-macro_rules! impl_leaf_staging {
-    (impl <$( $env_ty:ident ),*> $env:ty) => {
-        impl<R, T, $( $env_ty ),*> StageRead<R, $env> for Column<T>
-        where
-            R: Runtime,
-            T: MStorageElement,
-            Column<T>: BindSlots<$env>,
-        {
-            fn logical_len(&self) -> Result<usize, Error> {
-                Ok(self.len)
-            }
-
-            fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-                Ok(self.extent.clone())
-            }
-
-            fn stage_at(
-                &self,
-                _client: &ComputeClient<R>,
-                owner: u64,
-                bindings: &mut StagedBindings,
-            ) -> Result<(), Error> {
-                if self.owner != Some(owner) {
-                    return Err(Error::ForeignExecutor);
-                }
-                let handle = self.handle.clone().ok_or(Error::UnboundColumn)?;
-                bindings.push(handle, self.buffer_len, self.offset);
-                Ok(())
-            }
-        }
-
-        impl<R, T, $( $env_ty ),*> StageRead<R, $env> for Constant<T>
-        where
-            R: Runtime,
-            T: MStorageElement,
-            Constant<T>: BindSlots<$env>,
-        {
-            fn logical_len(&self) -> Result<usize, Error> {
-                Ok(self.len)
-            }
-
-            fn stage_at(
-                &self,
-                client: &ComputeClient<R>,
-                _owner: u64,
-                bindings: &mut StagedBindings,
-            ) -> Result<(), Error> {
-                let handle = client.create_from_slice(T::as_bytes(&[self.value]));
-                bindings.push(handle, 1, 0);
-                Ok(())
-            }
-        }
-
-        impl<R, T, $( $env_ty ),*> StageRead<R, $env> for crate::read::Value<T>
-        where
-            R: Runtime,
-            T: MStorageElement,
-            crate::read::Value<T>: BindSlots<$env>,
-        {
-            fn logical_len(&self) -> Result<usize, Error> {
-                Ok(1)
-            }
-
-            fn stage_at(
-                &self,
-                client: &ComputeClient<R>,
-                owner: u64,
-                bindings: &mut StagedBindings,
-            ) -> Result<(), Error> {
-                let handle = match self {
-                    crate::read::Value::Host(value) => {
-                        client.create_from_slice(T::as_bytes(&[*value]))
-                    }
-                    crate::read::Value::Device {
-                        handle,
-                        owner: value_owner,
-                    } => {
-                        if *value_owner != owner {
-                            return Err(Error::ForeignExecutor);
-                        }
-                        handle.clone()
-                    }
-                };
-                bindings.push(handle, 1, 0);
-                Ok(())
-            }
-        }
-
-        impl<R, $( $env_ty ),*> StageRead<R, $env> for Counting
-        where
-            R: Runtime,
-            Counting: BindSlots<$env>,
-        {
-            fn logical_len(&self) -> Result<usize, Error> {
-                Ok(self.len)
-            }
-
-            fn stage_at(
-                &self,
-                client: &ComputeClient<R>,
-                _owner: u64,
-                bindings: &mut StagedBindings,
-            ) -> Result<(), Error> {
-                let handle = client.create_from_slice(u32::as_bytes(&[self.start]));
-                bindings.push(handle, 1, 0);
-                Ok(())
-            }
-        }
-
-        impl<R, $( $env_ty ),*> StageRead<R, $env> for Stride
-        where
-            R: Runtime,
-            Stride: BindSlots<$env>,
-        {
-            fn logical_len(&self) -> Result<usize, Error> {
-                Ok(self.len)
-            }
-
-            fn stage_at(
-                &self,
-                client: &ComputeClient<R>,
-                _owner: u64,
-                bindings: &mut StagedBindings,
-            ) -> Result<(), Error> {
-                let handle = client.create_from_slice(u32::as_bytes(&[self.start, self.step]));
-                bindings.push(handle, 2, 0);
-                Ok(())
-            }
-        }
-
-        impl<R, $( $env_ty ),*> StageRead<R, $env> for DivModCounting
-        where
-            R: Runtime,
-            DivModCounting: BindSlots<$env>,
-        {
-            fn logical_len(&self) -> Result<usize, Error> {
-                Ok(self.len)
-            }
-
-            fn stage_at(
-                &self,
-                client: &ComputeClient<R>,
-                _owner: u64,
-                bindings: &mut StagedBindings,
-            ) -> Result<(), Error> {
-                let handle = client.create_from_slice(u32::as_bytes(&[
-                    self.start,
-                    self.divisor,
-                    self.modulus,
-                ]));
-                bindings.push(handle, 3, 0);
-                Ok(())
-            }
-        }
-
-        impl<R, $( $env_ty ),*> StageRead<R, $env> for ReverseCounting
-        where
-            R: Runtime,
-            ReverseCounting: BindSlots<$env>,
-        {
-            fn logical_len(&self) -> Result<usize, Error> {
-                Ok(self.len)
-            }
-
-            fn stage_at(
-                &self,
-                client: &ComputeClient<R>,
-                _owner: u64,
-                bindings: &mut StagedBindings,
-            ) -> Result<(), Error> {
-                let start = u32::try_from(self.start).map_err(|_| Error::LengthTooLarge {
-                    len: self.start.saturating_add(1),
-                })?;
-                let handle = client.create_from_slice(u32::as_bytes(&[start]));
-                bindings.push(handle, 1, 0);
-                Ok(())
-            }
-        }
-    };
-}
-
-impl_leaf_staging!(impl <> Env0);
-impl_leaf_staging!(impl <L0> Env1<L0>);
-impl_leaf_staging!(impl <L0, L1> Env2<L0, L1>);
-impl_leaf_staging!(impl <L0, L1, L2> Env3<L0, L1, L2>);
-impl_leaf_staging!(impl <L0, L1, L2, L3> Env4<L0, L1, L2, L3>);
-impl_leaf_staging!(impl <L0, L1, L2, L3, L4> Env5<L0, L1, L2, L3, L4>);
-impl_leaf_staging!(impl <L0, L1, L2, L3, L4, L5> Env6<L0, L1, L2, L3, L4, L5>);
-impl_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6> Env7<L0, L1, L2, L3, L4, L5, L6>);
-impl_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6, L7> Env8<L0, L1, L2, L3, L4, L5, L6, L7>);
-impl_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6, L7, L8> Env9<L0, L1, L2, L3, L4, L5, L6, L7, L8>);
-impl_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9> Env10<L0, L1, L2, L3, L4, L5, L6, L7, L8, L9>);
-impl_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10> Env11<L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10>);
-impl_leaf_staging!(impl <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11> Env12<L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11>);
-
-impl<R, Source, Env> StageRead<R, Env> for Taken<Source>
-where
-    R: Runtime,
-    Source: TakenSource,
-    Source::Read: StageRead<R, Env>,
-    Taken<Source>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        Ok(self.len as usize)
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        self.lower().stage_at(client, owner, bindings)
-    }
-}
-
-impl<R, Left, Right, Env> StageRead<R, Env> for Zip<Left, Right>
-where
-    R: Runtime,
-    Left: StageRead<R, Env>,
-    Right: StageRead<R, Left::NextEnv>,
-    Zip<Left, Right>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        let left = self.0.logical_len()?;
-        let right = self.1.logical_len()?;
-        if left != right {
-            return Err(Error::LengthMismatch { left, right });
-        }
-        Ok(left)
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        self.0.logical_extent()?.zipped(&self.1.logical_extent()?)
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        self.0.stage_at(client, owner, bindings)?;
-        self.1.stage_at(client, owner, bindings)
-    }
-}
-
-impl<R, Values, Offsets, Env> StageRead<R, Env> for crate::seg::SegmentRead<Values, Offsets>
-where
-    R: Runtime,
-    Values: StageRead<R, Env>,
-    Offsets: StageRead<R, Values::NextEnv>,
-    crate::seg::SegmentRead<Values, Offsets>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        crate::seg::segment_count(self.offsets().logical_len()?)
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        Ok(self
-            .offsets()
-            .logical_extent()?
-            .slice(1, self.logical_len()?))
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        self.values().stage_at(client, owner, bindings)?;
-        self.offsets().stage_at(client, owner, bindings)
-    }
-}
-
-impl<R, Input, Op, Env> StageRead<R, Env> for Transform<Input, Op>
-where
-    R: Runtime,
-    Input: ReadExpression + StageRead<R, Env>,
-    Op: UnaryOp<Input::Item>,
-    Transform<Input, Op>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        self.input.logical_len()
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        self.input.logical_extent()
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        self.input.stage_at(client, owner, bindings)
-    }
-}
-
-impl<R, Input, Op, Env> StageRead<R, Env> for crate::read::IndexedTransform<Input, Op>
-where
-    R: Runtime,
-    Input: ReadExpression + StageRead<R, Env>,
-    Op: crate::op::IndexedUnaryOp<Input::Item>,
-    crate::read::IndexedTransform<Input, Op>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        self.input.logical_len()
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        self.input.logical_extent()
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        self.input.stage_at(client, owner, bindings)
-    }
-}
-
-impl<R, Input, Op, Env> StageRead<R, Env> for crate::read::AdjacentIndexedTransform<Input, Op>
-where
-    R: Runtime,
-    Input: ReadExpression + StageRead<R, Env>,
-    Op: crate::op::IndexedBinaryOp<Input::Item>,
-    crate::read::AdjacentIndexedTransform<Input, Op>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        self.input.logical_len()
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        self.input.logical_extent()
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        self.input.stage_at(client, owner, bindings)
-    }
-}
-
-impl<R, Input, Op, Env> StageRead<R, Env> for crate::read::Adjacent<Input, Op>
-where
-    R: Runtime,
-    Input: ReadExpression + StageRead<R, Env>,
-    Op: ReductionOp<Input::Item>,
-    crate::read::Adjacent<Input, Op>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        self.input.logical_len()
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        self.input.logical_extent()
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        self.input.stage_at(client, owner, bindings)
-    }
-}
-
-impl<R, Input, Env> StageRead<R, Env> for crate::read::Slice<R, Input>
-where
-    R: Runtime,
-    Input: StageRead<R, Env>,
-    crate::read::Slice<R, Input>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        self.input.logical_len()
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        self.input.logical_extent()
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        self.input.stage_at(client, owner, bindings)
-    }
-}
-
-impl<R, Values, Indices, Env> StageRead<R, Env> for Permute<Values, Indices>
-where
-    R: Runtime,
-    Values: StageRead<R, Env>,
-    Indices: StageRead<R, Values::NextEnv>,
-    Permute<Values, Indices>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        self.indices.logical_len()
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        self.indices.logical_extent()
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        self.values.stage_at(client, owner, bindings)?;
-        self.indices.stage_at(client, owner, bindings)
-    }
-}
-
-impl<R, Values, Env> StageRead<R, Env> for crate::read::Reverse<Values>
-where
-    R: Runtime,
-    Values: StageRead<R, Env>,
-    crate::read::Reverse<Values>: BindSlots<Env>,
-{
-    fn logical_len(&self) -> Result<usize, Error> {
-        match self.len {
-            Some(len) => Ok(len),
-            None => self.values.logical_len(),
-        }
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        let capacity = self.logical_len()?;
-        Ok(self.values.logical_extent()?.slice(self.offset, capacity))
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut StagedBindings,
-    ) -> Result<(), Error> {
-        let exec = crate::Executor::from_client(client, owner);
-        let start = self
-            .values
-            .logical_extent()?
-            .reverse_start(&exec, self.offset)?;
-        self.values.stage_at(client, owner, bindings)?;
-        bindings.push(start.handle.clone(), 1, 0);
-        Ok(())
-    }
-}
-
 #[cubecl::cube]
-fn combine_plane_results<Item, Leaves, Layout, Op>(value: Leaves, value_valid: u32) -> (Leaves, u32)
+fn combine_plane_results<Item, Leaves, Layout, Op>(
+    value: Leaves,
+    value_valid: u32,
+    #[comptime] plane_capacity: usize,
+) -> (Leaves, u32)
 where
     Item: CubeType + Send + Sync + 'static,
     Leaves: SharedLeaves + MutableLeaves + PlaneShuffleLeaves + Send + Sync + 'static,
     Layout: Decompose<Item, Leaves = Leaves> + Recompose<Item, Leaves = Leaves>,
     Op: ReductionOp<Item>,
 {
-    let cube_dim = BLOCK_SIZE as usize;
-    let mut shared = Leaves::new_shared(cube_dim);
-    let mut plane_valid = Shared::<[u32]>::new_slice(cube_dim);
+    let mut shared = Leaves::new_shared(plane_capacity);
+    let mut plane_valid = Shared::<[u32]>::new_slice(plane_capacity);
     let result = value.into_cells();
     let result_valid = RuntimeCell::<u32>::new(0u32);
     if UNIT_POS_PLANE == 0u32 {
@@ -668,7 +121,7 @@ where
     }
     sync_cube();
     if PLANE_POS == 0u32 {
-        let plane_count = (CUBE_DIM + PLANE_DIM - 1u32) / PLANE_DIM;
+        let plane_count = CUBE_DIM.div_ceil(PLANE_DIM);
         let source = if UNIT_POS_PLANE < plane_count {
             UNIT_POS_PLANE as usize
         } else {
@@ -733,6 +186,7 @@ fn finish_reduce_value_padded12<
 >(
     value: Leaves,
     value_valid: u32,
+    #[comptime] with_init: bool,
     zero_offsets: &[u32],
     partial0: &mut [O0],
     partial1: &mut [O1],
@@ -746,24 +200,38 @@ fn finish_reduce_value_padded12<
     partial9: &mut [O9],
     partial10: &mut [O10],
     partial11: &mut [O11],
+    #[comptime] plane_capacity: usize,
 ) where
     Item: CubeType + Send + Sync + 'static,
-    O0: CubePrimitive,
-    O1: CubePrimitive,
-    O2: CubePrimitive,
-    O3: CubePrimitive,
-    O4: CubePrimitive,
-    O5: CubePrimitive,
-    O6: CubePrimitive,
-    O7: CubePrimitive,
-    O8: CubePrimitive,
-    O9: CubePrimitive,
-    O10: CubePrimitive,
-    O11: CubePrimitive,
+    O0: CubePrimitive + cubecl::frontend::Scalar,
+    O1: CubePrimitive + cubecl::frontend::Scalar,
+    O2: CubePrimitive + cubecl::frontend::Scalar,
+    O3: CubePrimitive + cubecl::frontend::Scalar,
+    O4: CubePrimitive + cubecl::frontend::Scalar,
+    O5: CubePrimitive + cubecl::frontend::Scalar,
+    O6: CubePrimitive + cubecl::frontend::Scalar,
+    O7: CubePrimitive + cubecl::frontend::Scalar,
+    O8: CubePrimitive + cubecl::frontend::Scalar,
+    O9: CubePrimitive + cubecl::frontend::Scalar,
+    O10: CubePrimitive + cubecl::frontend::Scalar,
+    O11: CubePrimitive + cubecl::frontend::Scalar,
     Leaves: SharedLeaves
         + MutableLeaves
         + PlaneShuffleLeaves
         + StorePadded12<
+            O0 = O0,
+            O1 = O1,
+            O2 = O2,
+            O3 = O3,
+            O4 = O4,
+            O5 = O5,
+            O6 = O6,
+            O7 = O7,
+            O8 = O8,
+            O9 = O9,
+            O10 = O10,
+            O11 = O11,
+        > + LoadMutPadded12<
             O0 = O0,
             O1 = O1,
             O2 = O2,
@@ -782,9 +250,36 @@ fn finish_reduce_value_padded12<
     Layout: Decompose<Item, Leaves = Leaves> + Recompose<Item, Leaves = Leaves>,
     Op: ReductionOp<Item>,
 {
-    let block_result = combine_plane_results::<Item, Leaves, Layout, Op>(value, value_valid);
+    let block_result =
+        combine_plane_results::<Item, Leaves, Layout, Op>(value, value_valid, plane_capacity);
     if block_result.1 != 0u32 {
-        block_result.0.store_padded(
+        let result = Leaves::into_cells(block_result.0);
+        if with_init {
+            let initial = Leaves::load_mut_padded(
+                partial0,
+                partial1,
+                partial2,
+                partial3,
+                partial4,
+                partial5,
+                partial6,
+                partial7,
+                partial8,
+                partial9,
+                partial10,
+                partial11,
+                zero_offsets,
+                0usize,
+            );
+            Leaves::store(
+                &result,
+                Layout::decompose(Op::apply(
+                    Layout::recompose(initial),
+                    Layout::recompose(Leaves::read(&result)),
+                )),
+            );
+        }
+        Leaves::read(&result).store_padded(
             partial0,
             partial1,
             partial2,
@@ -808,14 +303,17 @@ macro_rules! define_padded_reduce_eval_kernel {
         #[cubecl::cube(launch_unchecked, explicit_define)]
         fn $name<
             Item: CubeType + Send + Sync + 'static,
-            $( $leaf: CubePrimitive, )+
-            O0: CubePrimitive, O1: CubePrimitive, O2: CubePrimitive, O3: CubePrimitive,
-            O4: CubePrimitive, O5: CubePrimitive, O6: CubePrimitive, O7: CubePrimitive,
-            O8: CubePrimitive, O9: CubePrimitive, O10: CubePrimitive, O11: CubePrimitive,
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
+            O0: CubePrimitive + cubecl::frontend::Scalar, O1: CubePrimitive + cubecl::frontend::Scalar, O2: CubePrimitive + cubecl::frontend::Scalar, O3: CubePrimitive + cubecl::frontend::Scalar,
+            O4: CubePrimitive + cubecl::frontend::Scalar, O5: CubePrimitive + cubecl::frontend::Scalar, O6: CubePrimitive + cubecl::frontend::Scalar, O7: CubePrimitive + cubecl::frontend::Scalar,
+            O8: CubePrimitive + cubecl::frontend::Scalar, O9: CubePrimitive + cubecl::frontend::Scalar, O10: CubePrimitive + cubecl::frontend::Scalar, O11: CubePrimitive + cubecl::frontend::Scalar,
             Leaves: SharedLeaves
                 + MutableLeaves
                 + PlaneShuffleLeaves
                 + StorePadded12<
+                    O0 = O0, O1 = O1, O2 = O2, O3 = O3, O4 = O4, O5 = O5,
+                    O6 = O6, O7 = O7, O8 = O8, O9 = O9, O10 = O10, O11 = O11,
+                >                + LoadMutPadded12<
                     O0 = O0, O1 = O1, O2 = O2, O3 = O3, O4 = O4, O5 = O5,
                     O6 = O6, O7 = O7, O8 = O8, O9 = O9, O10 = O10, O11 = O11,
                 >
@@ -827,29 +325,28 @@ macro_rules! define_padded_reduce_eval_kernel {
             $( $slot: &[$leaf], )+
             read_offsets: &[u32],
             len: &[u32],
+            #[comptime] with_init: bool,
             zero_offsets: &[u32],
             partial0: &mut [O0], partial1: &mut [O1], partial2: &mut [O2],
             partial3: &mut [O3], partial4: &mut [O4], partial5: &mut [O5],
             partial6: &mut [O6], partial7: &mut [O7], partial8: &mut [O8],
             partial9: &mut [O9], partial10: &mut [O10], partial11: &mut [O11],
+            #[comptime] plane_capacity: usize,
         ) {
             let unit = UNIT_POS as usize;
             let cube_dim = BLOCK_SIZE as usize;
             let logical_len = len[0] as usize;
+            if CUBE_POS as usize >= crate::core::launch::logical_block_count(logical_len, TILE_SIZE) {
+                terminate!();
+            }
             let tile_start = (CUBE_POS as usize) * TILE_SIZE;
             let first_index = tile_start + unit;
-            let safe_index = if logical_len == 0usize {
-                0usize
-            } else if first_index < logical_len {
-                first_index
-            } else {
-                logical_len - 1usize
-            };
+            let safe_index = usize::min(first_index, logical_len - 1usize);
             let accumulator = Layout::decompose(
                 Expr::$method($( $slot, )+ read_offsets, safe_index),
             ).into_cells();
 
-            if tile_start + TILE_SIZE <= logical_len {
+            if logical_len - tile_start >= TILE_SIZE {
                 for item in 1usize..ITEMS_PER_UNIT {
                     let value = Expr::$method(
                         $( $slot, )+ read_offsets, first_index + item * cube_dim,
@@ -860,9 +357,9 @@ macro_rules! define_padded_reduce_eval_kernel {
                     Layout::recompose(Leaves::read(&accumulator)),
                 );
                 finish_reduce_value_padded12::<Item, O0, O1, O2, O3, O4, O5, O6, O7, O8, O9, O10, O11, Leaves, Layout, Op>(
-                    result, 1u32, zero_offsets,
+                    result, 1u32, with_init, zero_offsets,
                     partial0, partial1, partial2, partial3, partial4, partial5,
-                    partial6, partial7, partial8, partial9, partial10, partial11,
+                    partial6, partial7, partial8, partial9, partial10, partial11, plane_capacity,
                 );
             } else {
                 for item in 1usize..ITEMS_PER_UNIT {
@@ -877,9 +374,9 @@ macro_rules! define_padded_reduce_eval_kernel {
                     if first_index < logical_len { 1u32 } else { 0u32 },
                 );
                 finish_reduce_value_padded12::<Item, O0, O1, O2, O3, O4, O5, O6, O7, O8, O9, O10, O11, Leaves, Layout, Op>(
-                    result.0, result.1, zero_offsets,
+                    result.0, result.1, with_init, zero_offsets,
                     partial0, partial1, partial2, partial3, partial4, partial5,
-                    partial6, partial7, partial8, partial9, partial10, partial11,
+                    partial6, partial7, partial8, partial9, partial10, partial11, plane_capacity,
                 );
             }
         }
@@ -910,25 +407,134 @@ pub trait ReducePassDispatch<R, Input, Output, Item, Op, ReadSlots, WriteSlots>
 where
     R: Runtime,
 {
-    fn execute_pass(exec: &Executor<R>, input: &Input, output: &Output) -> Result<(), Error>;
+    fn execute_pass(
+        exec: &Executor<R>,
+        input: &Input,
+        output: &Output,
+        with_init: bool,
+    ) -> Result<(), Error>;
 }
 
-#[path = "reduce_fixed.rs"]
-mod reduce_fixed;
+macro_rules! impl_padded_reduce_pass_dispatch {
+    ($arity:ty,$eval:ident,$kernel:ident,$read_env:ty,$write_env:ty; [$( $leaf:ident:$index:literal ),+]) => {
+        impl<R, Input, Output, Item, Op, $( $leaf, )+ O0, O1, O2, O3, O4, O5, O6, O7, O8, O9, O10, O11>
+            ReducePassDispatch<R, Input, Output, Item, Op, $read_env, $write_env>
+            for Dispatch<$arity, S12>
+        where
+            R: Runtime,
+            Item: StorageLayout + Send + Sync + 'static,
+            $( $leaf: MStorageElement, )+
+            O0: MStorageElement,
+            O1: MStorageElement,
+            O2: MStorageElement,
+            O3: MStorageElement,
+            O4: MStorageElement,
+            O5: MStorageElement,
+            O6: MStorageElement,
+            O7: MStorageElement,
+            O8: MStorageElement,
+            O9: MStorageElement,
+            O10: MStorageElement,
+            O11: MStorageElement,
+            Op: ReductionOp<Item>,
+            Input: ReadExpression<Item = Item> + LowerReadExpression + StageRead<R, Env0>,
+            Input::Slots: PaddedReadSlots<
+                L0 = L0, L1 = L1, L2 = L2, L3 = L3, L4 = L4, L5 = L5, L6 = L6,
+                L7 = L7, L8 = L8, L9 = L9, L10 = L10, L11 = L11, L12 = L12,
+            >,
+            Input::DeviceExpr: $eval<Item, $( $leaf ),+>,
+            Output: crate::core::output::OutputExpression<Item = Item>
+                + crate::core::output::LowerOutputExpression
+                + crate::core::output::StageOutput<R, Env0>,
+            Output::Slots: crate::core::output::PaddedOutputSlots<Leaves = Item::StorageLeaves>,
+            Item::StorageLeaves: StorePadded12<
+                    O0 = O0, O1 = O1, O2 = O2, O3 = O3, O4 = O4, O5 = O5,
+                    O6 = O6, O7 = O7, O8 = O8, O9 = O9, O10 = O10, O11 = O11,
+                > + LoadMutPadded12<
+                    O0 = O0, O1 = O1, O2 = O2, O3 = O3, O4 = O4, O5 = O5,
+                    O6 = O6, O7 = O7, O8 = O8, O9 = O9, O10 = O10, O11 = O11,
+                > + SharedLeaves
+                + MutableLeaves
+                + PlaneShuffleLeaves
+                + Send
+                + Sync
+                + 'static,
+            Item::DeviceLayout: Decompose<Item, Leaves = Item::StorageLeaves>
+                + Recompose<Item, Leaves = Item::StorageLeaves>,
+        {
+            fn execute_pass(
+                exec: &Executor<R>,
+                input: &Input,
+                output: &Output,
+                with_init: bool,
+            ) -> Result<(), Error> {
+                let len = input.physical_len()?;
+                debug_assert!(len != 0);
+                let blocks = pass_block_count(len);
+                let bindings = Bindings::read(exec, input)?;
+                let output_bindings = Bindings::write(exec, output)?;
+                let offsets = exec.client().create_from_slice(u32::as_bytes(&bindings.offsets));
+                let zero_values = [0u32; 12];
+                let zero_offsets = exec.client().create_from_slice(u32::as_bytes(&zero_values));
+                let len_handle = input.logical_extent()?.materialize(exec)?;
+                unsafe {
+                    $kernel::launch_unchecked::<
+                        Item, $( $leaf, )+
+                        O0, O1, O2, O3, O4, O5, O6, O7, O8, O9, O10, O11,
+                        Item::StorageLeaves, Item::DeviceLayout, Input::DeviceExpr, Op, R,
+                    >(
+                        exec.client(),
+                        cube_count_1d(blocks)?,
+                        CubeDim::new_1d(BLOCK_SIZE),
+                        $( BufferArg::from_raw_parts(bindings.slots[$index].0.clone(), bindings.slots[$index].1), )+
+                        BufferArg::from_raw_parts(offsets, bindings.offsets.len()),
+                        BufferArg::from_raw_parts(len_handle.handle.clone(), 1),
+                        with_init,
+                        BufferArg::from_raw_parts(zero_offsets, 12),
+                        BufferArg::from_raw_parts(output_bindings.slots[0].0.clone(), output_bindings.slots[0].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[1].0.clone(), output_bindings.slots[1].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[2].0.clone(), output_bindings.slots[2].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[3].0.clone(), output_bindings.slots[3].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[4].0.clone(), output_bindings.slots[4].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[5].0.clone(), output_bindings.slots[5].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[6].0.clone(), output_bindings.slots[6].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[7].0.clone(), output_bindings.slots[7].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[8].0.clone(), output_bindings.slots[8].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[9].0.clone(), output_bindings.slots[9].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[10].0.clone(), output_bindings.slots[10].1),
+                        BufferArg::from_raw_parts(output_bindings.slots[11].0.clone(), output_bindings.slots[11].1),
+                        crate::core::launch::plane_count_bound(exec, BLOCK_SIZE),
+                    );
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
+impl_padded_reduce_pass_dispatch!(
+    A13,
+    Eval13,
+    padded_reduce_a13,
+    Env13<L0,L1,L2,L3,L4,L5,L6,L7,L8,L9,L10,L11,L12>,
+    Env12<O0,O1,O2,O3,O4,O5,O6,O7,O8,O9,O10,O11>;
+    [L0:0,L1:1,L2:2,L3:3,L4:4,L5:5,L6:6,L7:7,L8:8,L9:9,L10:10,L11:11,L12:12]
+);
 
 fn reduce_pass<R, Input, Output, Item, Op>(
     exec: &Executor<R>,
     input: &Input,
     output: &Output,
+    with_init: bool,
 ) -> Result<(), Error>
 where
     R: Runtime,
     Input: ReadExpression<Item = Item>
-        + LowerReadExpression<Slots: crate::read::PaddedReadSlots>
+        + LowerReadExpression<Slots: crate::core::read::PaddedReadSlots>
         + StageRead<R, Env0>,
-    Output: crate::output::OutputExpression<Item = Item>
-        + crate::output::LowerOutputExpression<Slots: crate::output::PaddedOutputSlots>
-        + crate::output::StageOutput<R, Env0>,
+    Output: crate::core::output::OutputExpression<Item = Item>
+        + crate::core::output::LowerOutputExpression<Slots: crate::core::output::PaddedOutputSlots>
+        + crate::core::output::StageOutput<R, Env0>,
     Item: StorageLayout,
     Op: ReductionOp<Item>,
     Dispatch<A13, S12>: ReducePassDispatch<
@@ -937,8 +543,8 @@ where
             Output,
             Item,
             Op,
-            crate::read::KernelReadSlots<Input::Slots>,
-            crate::output::KernelOutputSlots<Output::Slots>,
+            crate::core::read::KernelReadSlots<Input::Slots>,
+            crate::core::output::KernelOutputSlots<Output::Slots>,
         >,
 {
     <Dispatch<A13, S12> as ReducePassDispatch<
@@ -947,9 +553,9 @@ where
         Output,
         Item,
         Op,
-        crate::read::KernelReadSlots<Input::Slots>,
-        crate::output::KernelOutputSlots<Output::Slots>,
-    >>::execute_pass(exec, input, output)
+        crate::core::read::KernelReadSlots<Input::Slots>,
+        crate::core::output::KernelOutputSlots<Output::Slots>,
+    >>::execute_pass(exec, input, output, with_init)
 }
 
 fn finish_fixed_reduce<R, Item, Op>(
@@ -968,47 +574,34 @@ where
             FixedReduceOutput<R, Item>,
             Item,
             Op,
-            crate::read::KernelReadSlots<<FixedReduceRead<R, Item> as LowerReadExpression>::Slots>,
-            crate::output::KernelOutputSlots<
-                <FixedReduceOutput<R, Item> as crate::output::LowerOutputExpression>::Slots,
+            crate::core::read::KernelReadSlots<
+                <FixedReduceRead<R, Item> as LowerReadExpression>::Slots,
+            >,
+            crate::core::output::KernelOutputSlots<
+                <FixedReduceOutput<R, Item> as crate::core::output::LowerOutputExpression>::Slots,
             >,
         >,
 {
-    while current_len > 1 {
+    loop {
         let next_len = pass_block_count(current_len);
-        let current_extent = RowStorage::logical_extent(&current);
-        let mut next = Item::alloc_scratch(exec, next_len);
-        RowStorage::set_logical_extent(
-            &mut next,
-            current_extent.ceil_div(exec, TILE_SIZE, next_len)?,
-        );
+        let final_pass = next_len == 1;
+        let mut next = if final_pass {
+            init.clone()
+        } else {
+            Item::alloc_scratch(exec, next_len)
+        };
+        if !final_pass {
+            let extent = RowStorage::logical_extent(&current);
+            RowStorage::set_logical_extent(&mut next, extent.ceil_div(exec, TILE_SIZE, next_len)?);
+        }
         let input = FixedReduceRead::<R, Item>::new(current.read());
-        let output = next.write();
-        reduce_pass::<R, _, _, Item, Op>(exec, &input, &output)?;
+        reduce_pass::<R, _, _, Item, Op>(exec, &input, &next.write(), final_pass)?;
+        if final_pass {
+            return Ok(init);
+        }
         current = next;
         current_len = next_len;
     }
-
-    let current_extent = RowStorage::logical_extent(&current);
-    let mut combined = Item::alloc_scratch(exec, 2);
-    init.copy_storage(exec, combined.slice_mut(..1))?;
-    current.copy_storage(exec, combined.slice_mut(1..))?;
-    RowStorage::set_logical_extent(
-        &mut combined,
-        crate::extent::LogicalExtent::add(
-            exec,
-            &crate::extent::LogicalExtent::fixed(1),
-            &current_extent,
-            2,
-        )?,
-    );
-
-    let result = Item::alloc_scratch(exec, 1);
-    let input = FixedReduceRead::<R, Item>::new(combined.read());
-    let output = result.write();
-    reduce_pass::<R, _, _, Item, Op>(exec, &input, &output)?;
-
-    Ok(result)
 }
 
 impl<R, Input, Item, Op, Slots> ReduceDispatch<R, Input, Item, Op, Slots> for Dispatch<A13, S12>
@@ -1024,8 +617,8 @@ where
             Item,
             Op,
             Slots,
-            crate::output::KernelOutputSlots<
-                <FixedReduceOutput<R, Item> as crate::output::LowerOutputExpression>::Slots,
+            crate::core::output::KernelOutputSlots<
+                <FixedReduceOutput<R, Item> as crate::core::output::LowerOutputExpression>::Slots,
             >,
         > + ReducePassDispatch<
             R,
@@ -1033,9 +626,11 @@ where
             FixedReduceOutput<R, Item>,
             Item,
             Op,
-            crate::read::KernelReadSlots<<FixedReduceRead<R, Item> as LowerReadExpression>::Slots>,
-            crate::output::KernelOutputSlots<
-                <FixedReduceOutput<R, Item> as crate::output::LowerOutputExpression>::Slots,
+            crate::core::read::KernelReadSlots<
+                <FixedReduceRead<R, Item> as LowerReadExpression>::Slots,
+            >,
+            crate::core::output::KernelOutputSlots<
+                <FixedReduceOutput<R, Item> as crate::core::output::LowerOutputExpression>::Slots,
             >,
         >,
 {
@@ -1046,14 +641,24 @@ where
         input: &Input,
         init: Self::Storage,
     ) -> Result<Self::Storage, Error> {
-        let len = input.logical_len()?;
+        let len = input.physical_len()?;
         if len == 0 {
             return Ok(init);
         }
         let extent = input.logical_extent()?;
         let blocks = pass_block_count(len);
-        let mut partials = Item::alloc_scratch(exec, blocks);
-        RowStorage::set_logical_extent(&mut partials, extent.ceil_div(exec, TILE_SIZE, blocks)?);
+        let final_pass = blocks == 1;
+        let mut partials = if final_pass {
+            init.clone()
+        } else {
+            Item::alloc_scratch(exec, blocks)
+        };
+        if !final_pass {
+            RowStorage::set_logical_extent(
+                &mut partials,
+                extent.ceil_div(exec, TILE_SIZE, blocks)?,
+            );
+        }
         let output = partials.write();
         <Dispatch<A13, S12> as ReducePassDispatch<
             R,
@@ -1062,10 +667,13 @@ where
             Item,
             Op,
             Slots,
-            crate::output::KernelOutputSlots<
-                <FixedReduceOutput<R, Item> as crate::output::LowerOutputExpression>::Slots,
+            crate::core::output::KernelOutputSlots<
+                <FixedReduceOutput<R, Item> as crate::core::output::LowerOutputExpression>::Slots,
             >,
-        >>::execute_pass(exec, input, &output)?;
+        >>::execute_pass(exec, input, &output, final_pass)?;
+        if final_pass {
+            return Ok(init);
+        }
         finish_fixed_reduce::<R, Item, Op>(exec, partials, blocks, init)
     }
 }
@@ -1079,7 +687,7 @@ pub(crate) fn reduce<R, Input, Op>(
         Input,
         Input::Item,
         Op,
-        crate::read::KernelReadSlots<Input::Slots>,
+        crate::core::read::KernelReadSlots<Input::Slots>,
     >>::Storage,
     _op: Op,
 ) -> Result<
@@ -1088,7 +696,7 @@ pub(crate) fn reduce<R, Input, Op>(
         Input,
         Input::Item,
         Op,
-        crate::read::KernelReadSlots<Input::Slots>,
+        crate::core::read::KernelReadSlots<Input::Slots>,
     >>::Storage,
     Error,
 >
@@ -1098,20 +706,23 @@ where
     Input::Item: StorageLayout,
     Op: ReductionOp<Input::Item>,
     Dispatch<A13, S12>:
-        ReduceDispatch<R, Input, Input::Item, Op, crate::read::KernelReadSlots<Input::Slots>>,
+        ReduceDispatch<R, Input, Input::Item, Op, crate::core::read::KernelReadSlots<Input::Slots>>,
 {
     <Dispatch<A13, S12> as ReduceDispatch<
         R,
         Input,
         Input::Item,
         Op,
-        crate::read::KernelReadSlots<Input::Slots>,
+        crate::core::read::KernelReadSlots<Input::Slots>,
     >>::execute(exec, &input, init)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::iter::Zip;
+    use crate::core::op::UnaryOp;
+    use crate::core::read::{Column, Counting, Permute, Transform};
     use crate::op::Identity;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
@@ -1191,7 +802,68 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_a1_storage1_fuses_column_transform_reduce() {
+    fn generated_reduce_pass_fits_the_binding_budget() {
+        type ScalarLeaves = <u32 as StorageLayout>::StorageLeaves;
+        type ScalarExpr = <Column<u32> as LowerReadExpression>::DeviceExpr;
+        type ScalarLayout = <u32 as StorageLayout>::DeviceLayout;
+        type Kernel = padded_reduce_a13::PaddedReduceA13<
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            ScalarLeaves,
+            ScalarLayout,
+            ScalarExpr,
+            Sum,
+            WgpuRuntime,
+        >;
+
+        let exec = executor();
+        let settings = KernelSettings::new(
+            CubeDim::new_1d(BLOCK_SIZE).into(),
+            ExecutionMode::Unchecked,
+            AddressType::U32,
+        );
+        let mut launcher = KernelLauncher::<WgpuRuntime>::new(settings.clone());
+        let handle = exec.client().empty(core::mem::size_of::<u32>());
+        let arg = unsafe {
+            <[u32] as LaunchArg>::register(BufferArg::from_raw_parts(handle, 1), &mut launcher)
+        };
+        let kernel = crate::core::launch::kernel_with_max_explicit_storage_bindings!(
+            Kernel,
+            settings,
+            exec.client().clone(),
+            arg,
+            true,
+            crate::core::launch::plane_count_bound(&exec, BLOCK_SIZE)
+        );
+        crate::core::launch::assert_binding_budget("reduce pass", &kernel);
+    }
+
+    #[test]
+    fn one_read_slot_storage1_fuses_column_transform_reduce() {
         let exec = executor();
         let len = 4097;
         let values = exec.to_device(&vec![1_u32; len]);
@@ -1202,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_a2_storage1_fuses_binary_zip_transform_reduce() {
+    fn two_read_slots_storage1_fuse_binary_zip_transform_reduce() {
         let exec = executor();
         let len = 4097;
         let left = exec.to_device(&vec![1_u32; len]);
@@ -1214,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_a3_storage1_uses_flat_zip_semantics() {
+    fn three_read_slots_storage1_use_flat_zip_semantics() {
         let exec = executor();
         let len = 4097;
         let first = exec.to_device(&vec![1_u32; len]);
@@ -1249,12 +921,8 @@ mod tests {
         ));
     }
 
-    type FourColumns = Zip<Zip<Zip<Column<u32>, Column<u32>>, Column<u32>>, Column<u32>>;
-    type FourInput = Transform<FourColumns, AddFour>;
-    type FourExpr = <FourInput as LowerReadExpression>::DeviceExpr;
-
     #[test]
-    fn dispatch_a4_storage1_is_a_regular_evaluator_path() {
+    fn four_read_slots_storage1_use_the_fixed_evaluator_path() {
         let exec = executor();
         let columns: Vec<_> = (1_u32..=4)
             .map(|value| exec.to_device(&vec![value; 513]))
@@ -1274,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_a8_storage7_reduces_semantic_item_with_physical_leaf_partials() {
+    fn eight_read_slots_storage7_reduce_with_physical_leaf_partials() {
         let exec = executor();
         let len = TILE_SIZE * 2 + 17;
         let columns: Vec<_> = (1_u32..=7)
@@ -1321,12 +989,5 @@ mod tests {
                 70 + 7 * len as u32,
             )
         );
-    }
-
-    #[allow(dead_code)]
-    fn a4_expression_still_has_a_valid_evaluator()
-    where
-        FourExpr: crate::eval::Eval4<u32, u32, u32, u32, u32>,
-    {
     }
 }

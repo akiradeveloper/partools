@@ -7,7 +7,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use cubecl::prelude::*;
 use std::ops::RangeBounds;
 
-use crate::{Column, Error, MStorageElement, extent::LogicalExtent};
+use crate::Error;
+use crate::core::extent::LogicalExtent;
+use crate::core::read::Column;
+use crate::core::value::MStorageElement;
 
 static NEXT_EXECUTOR_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -229,7 +232,7 @@ impl<R: Runtime, T> DeviceSlice<R, T> {
     where
         Range: RangeBounds<crate::MIndex>,
     {
-        let (offset, len) = crate::read::resolve_mindex_slice_range(self.column.len, range);
+        let (offset, len) = crate::core::read::resolve_mindex_slice_range(self.column.len, range);
         Self::from_column(self.column.slice_usize(offset..offset + len))
     }
 }
@@ -258,7 +261,7 @@ impl<R: Runtime, T> DeviceSliceMut<R, T> {
     where
         Range: RangeBounds<crate::MIndex>,
     {
-        let (offset, len) = crate::read::resolve_mindex_slice_range(self.output.len, range);
+        let (offset, len) = crate::core::read::resolve_mindex_slice_range(self.output.len, range);
         DeviceSlice::from_column(self.output.slice_usize(offset..offset + len))
     }
 
@@ -267,7 +270,7 @@ impl<R: Runtime, T> DeviceSliceMut<R, T> {
     where
         Range: RangeBounds<crate::MIndex>,
     {
-        let (offset, len) = crate::read::resolve_mindex_slice_range(self.output.len, range);
+        let (offset, len) = crate::core::read::resolve_mindex_slice_range(self.output.len, range);
         Self::from_output(self.output.slice_mut_usize(offset..offset + len))
     }
 }
@@ -337,7 +340,7 @@ impl<R: Runtime, T> DeviceVec<R, T> {
     where
         Range: RangeBounds<crate::MIndex>,
     {
-        let (offset, len) = crate::read::resolve_mindex_slice_range(self.len, range);
+        let (offset, len) = crate::core::read::resolve_mindex_slice_range(self.len, range);
         DeviceSlice::from_column(self.column().slice_usize(offset..offset + len))
     }
 
@@ -367,7 +370,7 @@ impl<R: Runtime, T> DeviceVec<R, T> {
     where
         Range: RangeBounds<crate::MIndex>,
     {
-        let (offset, len) = crate::read::resolve_mindex_slice_range(self.len, range);
+        let (offset, len) = crate::core::read::resolve_mindex_slice_range(self.len, range);
         DeviceSliceMut::from_output(self.slice_mut_usize(offset..offset + len))
     }
 
@@ -375,7 +378,7 @@ impl<R: Runtime, T> DeviceVec<R, T> {
     where
         Range: RangeBounds<usize>,
     {
-        let (offset, len) = crate::read::resolve_slice_range(self.len, range);
+        let (offset, len) = crate::core::read::resolve_slice_range(self.len, range);
         ColumnMut {
             handle: self.handle.clone(),
             len,
@@ -493,7 +496,7 @@ impl<T> ColumnMut<T> {
     where
         Range: RangeBounds<usize>,
     {
-        let (offset, len) = crate::read::resolve_slice_range(self.len, range);
+        let (offset, len) = crate::core::read::resolve_slice_range(self.len, range);
         Column::from_handle(
             self.handle.clone(),
             len,
@@ -508,7 +511,7 @@ impl<T> ColumnMut<T> {
     where
         Range: RangeBounds<usize>,
     {
-        let (offset, len) = crate::read::resolve_slice_range(self.len, range);
+        let (offset, len) = crate::core::read::resolve_slice_range(self.len, range);
         Self {
             handle: self.handle.clone(),
             len,

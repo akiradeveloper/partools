@@ -213,7 +213,7 @@ fn mutable_slice_adapters_compose_and_can_be_read_back() {
 }
 
 #[test]
-fn gather_keeps_an_eval8_value_expression_lazy() {
+fn gather_keeps_an_eight_slot_value_expression_lazy() {
     let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
     let columns: Vec<_> = (0_u32..8)
         .map(|column| exec.to_device(&[column, column + 10, column + 20]))

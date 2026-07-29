@@ -71,7 +71,7 @@ fn bench_by_key_patterns(c: &mut Criterion) {
                         black_box(keys.slice(..)),
                         black_box(values.slice(..)),
                         Equal,
-                        init.clone(),
+                        init,
                         Sum,
                     )
                     .unwrap();
@@ -96,7 +96,7 @@ fn bench_by_key_patterns(c: &mut Criterion) {
                         black_box(keys.slice(..)),
                         black_box(values.slice(..)),
                         Equal,
-                        init.clone(),
+                        init,
                         Sum,
                     )
                     .unwrap();

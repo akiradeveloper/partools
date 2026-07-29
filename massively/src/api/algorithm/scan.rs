@@ -2,10 +2,9 @@
 
 use cubecl::prelude::{CubeType, Runtime};
 
-use crate::{
-    Error, Executor, MAlloc, MIter, MIterMut, MStorage, MVec, api::iter::MStorageExtent,
-    op::ReductionOp,
-};
+use crate::api::iter::MStorageExtent;
+use crate::op::ReductionOp;
+use crate::{Error, Executor, MAlloc, MIter, MIterMut, MStorage, MVec};
 
 struct ScanOperation<'a, R: Runtime, Input, Op, const ADJACENT: bool> {
     exec: &'a Executor<R>,
@@ -32,10 +31,10 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        crate::scan::exclusive_scan(
+        crate::core::scan::exclusive_scan(
             self.exec,
             crate::api::iter::lower_fixed::<R, _>(self.input),
             crate::api::value::into_scratch::<R, Item>(self.init),
@@ -57,14 +56,14 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
         let input = crate::api::iter::lower_fixed::<R, _>(self.input);
         if ADJACENT {
-            crate::scan::adjacent_difference(self.exec, input, self.op, output)
+            crate::core::scan::adjacent_difference(self.exec, input, self.op, output)
         } else {
-            crate::scan::inclusive_scan(self.exec, input, self.op, output)
+            crate::core::scan::inclusive_scan(self.exec, input, self.op, output)
         }
     }
 }

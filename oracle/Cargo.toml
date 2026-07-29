@@ -16,7 +16,7 @@ name = "oracle"
 
 [dev-dependencies]
 cubecl = { workspace = true, features = ["wgpu"] }
-massively = { path = "../../massively" }
+massively = { path = "../massively" }
 proptest = "1"
 
 [[test]]

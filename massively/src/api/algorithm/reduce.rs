@@ -2,7 +2,8 @@
 
 use cubecl::prelude::Runtime;
 
-use crate::{Error, Executor, MAlloc, MIter, op::ReductionOp};
+use crate::op::ReductionOp;
+use crate::{Error, Executor, MAlloc, MIter};
 
 /// Reduces all input items, starting from `init`.
 ///

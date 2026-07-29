@@ -1,4 +1,8 @@
-//! Type-level read arity.
+//! Type-level read arity and kernel dispatch keys.
+
+/// Dispatch key combining a kernel's read and storage arities.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Dispatch<Read, Storage>(core::marker::PhantomData<fn() -> (Read, Storage)>);
 
 /// A supported number of physical leaves read by an expression.
 pub trait ReadArity: private::Sealed + 'static {}

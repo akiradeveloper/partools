@@ -4,15 +4,13 @@ use core::marker::PhantomData;
 use cubecl::prelude::*;
 use std::rc::Rc;
 
-use crate::{
-    op::{IndexedBinaryOp, IndexedUnaryOp, UnaryOp},
-    reduce::ReductionOp,
-    seg::{Segment, SegmentExpand, SegmentReader},
-    storage::{
-        Concat, ConcatExpand, Decompose, JoinedReadRow, ReadFlatLeaves, ReadLayout, ReadRow,
-        Recompose, SelectLeaves,
-    },
+use crate::core::op::ReductionOp;
+use crate::core::storage::{
+    Concat, ConcatExpand, Decompose, JoinedReadRow, ReadFlatLeaves, ReadLayout, ReadRow, Recompose,
+    SelectLeaves,
 };
+use crate::op::{IndexedBinaryOp, IndexedUnaryOp, UnaryOp};
+use crate::seg::{Segment, SegmentExpand, SegmentReader};
 
 /// A type-level device expression producing `Item`.
 #[doc(hidden)]
@@ -21,7 +19,7 @@ pub trait DeviceExpr<Item: CubeType>: 'static + Send + Sync {}
 /// How a staged leaf slot is interpreted.
 #[doc(hidden)]
 #[cubecl::cube]
-pub trait ReadMode<T: CubePrimitive>: 'static + Send + Sync {
+pub trait ReadMode<T: CubePrimitive + cubecl::frontend::Scalar>: 'static + Send + Sync {
     fn read(slot: &[T], offset: u32, index: usize) -> T;
 }
 
@@ -65,14 +63,14 @@ where
 }
 
 #[cubecl::cube]
-impl<T: CubePrimitive> ReadMode<T> for Direct {
+impl<T: CubePrimitive + cubecl::frontend::Scalar> ReadMode<T> for Direct {
     fn read(slot: &[T], offset: u32, index: usize) -> T {
         slot[offset as usize + index]
     }
 }
 
 #[cubecl::cube]
-impl<T: CubePrimitive> ReadMode<T> for Broadcast {
+impl<T: CubePrimitive + cubecl::frontend::Scalar> ReadMode<T> for Broadcast {
     fn read(slot: &[T], _offset: u32, _index: usize) -> T {
         slot[0]
     }
@@ -116,7 +114,7 @@ macro_rules! define_slots {
 
             impl<T, Mode> DeviceExpr<T> for $slot<T, Mode>
             where
-                T: CubePrimitive + 'static,
+                T: CubePrimitive + cubecl::frontend::Scalar + 'static,
                 Mode: ReadMode<T>,
             {
             }
@@ -222,11 +220,24 @@ where
 {
 }
 
+/// Device expression that repeats the first row of its input.
+#[doc(hidden)]
+pub struct RepeatExpr<InputExpr> {
+    _marker: PhantomData<fn() -> InputExpr>,
+}
+
+impl<InputExpr, Item> DeviceExpr<Item> for RepeatExpr<InputExpr>
+where
+    Item: CubeType + 'static,
+    InputExpr: DeviceExpr<Item>,
+{
+}
+
 macro_rules! define_eval {
     ($trait_name:ident, $method:ident; $( $leaf:ident : $slot:ident ),+ $(,)?) => {
         #[doc = concat!("Evaluates a device expression using `", stringify!($trait_name), "` staged leaves.")]
         #[cubecl::cube]
-        pub trait $trait_name<Item: CubeType, $( $leaf: CubePrimitive ),+>: DeviceExpr<Item> {
+        pub trait $trait_name<Item: CubeType, $( $leaf: CubePrimitive + cubecl::frontend::Scalar ),+>: DeviceExpr<Item> {
             fn $method(
                 $( $slot: &[$leaf], )+
                 slot_offsets: &[u32],
@@ -245,7 +256,7 @@ macro_rules! define_eval {
                 ReadFlatLeaves<Item = LeftItem> + Concat<RightItem::ReadLeaves>,
             RightItem::ReadLeaves: ReadFlatLeaves<Item = RightItem>,
             <LeftItem::ReadLeaves as Concat<RightItem::ReadLeaves>>::Output: ReadFlatLeaves,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             LeftExpr: $trait_name<LeftItem, $( $leaf ),+>,
             RightExpr: $trait_name<RightItem, $( $leaf ),+>,
         {
@@ -272,7 +283,7 @@ macro_rules! define_eval {
         where
             InputItem: CubeType + 'static,
             OutputItem: CubeType + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             InputExpr: $trait_name<InputItem, $( $leaf ),+>,
             Op: UnaryOp<InputItem, Output = OutputItem>,
         {
@@ -293,7 +304,7 @@ macro_rules! define_eval {
         where
             InputItem: CubeType + 'static,
             OutputItem: CubeType + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             InputExpr: $trait_name<InputItem, $( $leaf ),+>,
             Op: IndexedBinaryOp<InputItem, Output = OutputItem>,
         {
@@ -320,7 +331,7 @@ macro_rules! define_eval {
         where
             InputItem: CubeType + 'static,
             OutputItem: CubeType + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             InputExpr: $trait_name<InputItem, $( $leaf ),+>,
             Op: IndexedUnaryOp<InputItem, Output = OutputItem>,
         {
@@ -340,7 +351,7 @@ macro_rules! define_eval {
             for AdjacentExpr<InputExpr, Item, Op, Layout, Leaves>
         where
             Item: CubeType + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             InputExpr: $trait_name<Item, $( $leaf ),+>,
             Op: ReductionOp<Item>,
             Leaves: CubeType + SelectLeaves + 'static,
@@ -368,7 +379,7 @@ macro_rules! define_eval {
             $trait_name<Item, $( $leaf ),+> for PermuteExpr<ValuesExpr, IndicesExpr>
         where
             Item: CubeType + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             ValuesExpr: $trait_name<Item, $( $leaf ),+>,
             IndicesExpr: $trait_name<crate::MIndex, $( $leaf ),+>,
         {
@@ -382,22 +393,605 @@ macro_rules! define_eval {
             }
         }
 
+        #[cubecl::cube]
+        impl<Item, InputExpr, $( $leaf ),+>
+            $trait_name<Item, $( $leaf ),+> for RepeatExpr<InputExpr>
+        where
+            Item: CubeType + 'static,
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
+            InputExpr: $trait_name<Item, $( $leaf ),+>,
+        {
+            fn $method(
+                $( $slot: &[$leaf], )+
+                slot_offsets: &[u32],
+                _index: usize,
+            ) -> Item {
+                InputExpr::$method($( $slot, )+ slot_offsets, 0usize)
+            }
+        }
+
     };
 }
 
-define_eval!(Eval1, eval1; L0: slot0);
-define_eval!(Eval2, eval2; L0: slot0, L1: slot1);
-define_eval!(Eval3, eval3; L0: slot0, L1: slot1, L2: slot2);
-define_eval!(Eval4, eval4; L0: slot0, L1: slot1, L2: slot2, L3: slot3);
-define_eval!(Eval5, eval5; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4);
-define_eval!(Eval6, eval6; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5);
-define_eval!(Eval7, eval7; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6);
-define_eval!(Eval8, eval8; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7);
-define_eval!(Eval9, eval9; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8);
-define_eval!(Eval10, eval10; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8, L9: slot9);
-define_eval!(Eval11, eval11; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8, L9: slot9, L10: slot10);
-define_eval!(Eval12, eval12; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8, L9: slot9, L10: slot10, L11: slot11);
 define_eval!(Eval13, eval13; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8, L9: slot9, L10: slot10, L11: slot11, L12: slot12);
+
+/// Evaluates a fixed thirteen-slot expression from a subrange of a shared
+/// offsets buffer. Two independent expressions can therefore share one
+/// binding without changing their slot types or forming an arity cross-product.
+#[doc(hidden)]
+#[cubecl::cube]
+pub trait Eval13At<
+    Item: CubeType,
+    L0: CubePrimitive + cubecl::frontend::Scalar,
+    L1: CubePrimitive + cubecl::frontend::Scalar,
+    L2: CubePrimitive + cubecl::frontend::Scalar,
+    L3: CubePrimitive + cubecl::frontend::Scalar,
+    L4: CubePrimitive + cubecl::frontend::Scalar,
+    L5: CubePrimitive + cubecl::frontend::Scalar,
+    L6: CubePrimitive + cubecl::frontend::Scalar,
+    L7: CubePrimitive + cubecl::frontend::Scalar,
+    L8: CubePrimitive + cubecl::frontend::Scalar,
+    L9: CubePrimitive + cubecl::frontend::Scalar,
+    L10: CubePrimitive + cubecl::frontend::Scalar,
+    L11: CubePrimitive + cubecl::frontend::Scalar,
+    L12: CubePrimitive + cubecl::frontend::Scalar,
+>: Eval13<Item, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+{
+    fn eval13_at(
+        slot0: &[L0],
+        slot1: &[L1],
+        slot2: &[L2],
+        slot3: &[L3],
+        slot4: &[L4],
+        slot5: &[L5],
+        slot6: &[L6],
+        slot7: &[L7],
+        slot8: &[L8],
+        slot9: &[L9],
+        slot10: &[L10],
+        slot11: &[L11],
+        slot12: &[L12],
+        slot_offsets: &[u32],
+        offset_base: usize,
+        index: usize,
+    ) -> Item;
+}
+
+#[cubecl::cube]
+impl<
+    LeftItem,
+    RightItem,
+    LeftExpr,
+    RightExpr,
+    L0,
+    L1,
+    L2,
+    L3,
+    L4,
+    L5,
+    L6,
+    L7,
+    L8,
+    L9,
+    L10,
+    L11,
+    L12,
+>
+    Eval13At<
+        JoinedReadRow<LeftItem, RightItem>,
+        L0,
+        L1,
+        L2,
+        L3,
+        L4,
+        L5,
+        L6,
+        L7,
+        L8,
+        L9,
+        L10,
+        L11,
+        L12,
+    > for ZipExpr<LeftExpr, RightExpr, LeftItem, RightItem>
+where
+    LeftItem: ReadRow + 'static,
+    RightItem: ReadRow + 'static,
+    LeftItem::ReadLeaves: ReadFlatLeaves<Item = LeftItem> + Concat<RightItem::ReadLeaves>,
+    RightItem::ReadLeaves: ReadFlatLeaves<Item = RightItem>,
+    <LeftItem::ReadLeaves as Concat<RightItem::ReadLeaves>>::Output: ReadFlatLeaves,
+    L0: CubePrimitive + cubecl::frontend::Scalar,
+    L1: CubePrimitive + cubecl::frontend::Scalar,
+    L2: CubePrimitive + cubecl::frontend::Scalar,
+    L3: CubePrimitive + cubecl::frontend::Scalar,
+    L4: CubePrimitive + cubecl::frontend::Scalar,
+    L5: CubePrimitive + cubecl::frontend::Scalar,
+    L6: CubePrimitive + cubecl::frontend::Scalar,
+    L7: CubePrimitive + cubecl::frontend::Scalar,
+    L8: CubePrimitive + cubecl::frontend::Scalar,
+    L9: CubePrimitive + cubecl::frontend::Scalar,
+    L10: CubePrimitive + cubecl::frontend::Scalar,
+    L11: CubePrimitive + cubecl::frontend::Scalar,
+    L12: CubePrimitive + cubecl::frontend::Scalar,
+    LeftExpr: Eval13At<LeftItem, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+    RightExpr: Eval13At<RightItem, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+{
+    fn eval13_at(
+        slot0: &[L0],
+        slot1: &[L1],
+        slot2: &[L2],
+        slot3: &[L3],
+        slot4: &[L4],
+        slot5: &[L5],
+        slot6: &[L6],
+        slot7: &[L7],
+        slot8: &[L8],
+        slot9: &[L9],
+        slot10: &[L10],
+        slot11: &[L11],
+        slot12: &[L12],
+        slot_offsets: &[u32],
+        offset_base: usize,
+        index: usize,
+    ) -> JoinedReadRow<LeftItem, RightItem> {
+        let left = LeftItem::ReadDeviceLayout::decompose(LeftExpr::eval13_at(
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            offset_base,
+            index,
+        ));
+        let right = RightItem::ReadDeviceLayout::decompose(RightExpr::eval13_at(
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            offset_base,
+            index,
+        ));
+        <<JoinedReadRow<LeftItem, RightItem> as ReadLayout>::ReadDeviceLayout as Recompose<
+            JoinedReadRow<LeftItem, RightItem>,
+        >>::recompose(left.concat(right))
+    }
+}
+
+macro_rules! impl_unary_eval13_at {
+    ($expr:ident, $op:ident, $input:ident, $index:ident; $body:expr) => {
+        #[cubecl::cube]
+        impl<
+            InputItem,
+            OutputItem,
+            InputExpr,
+            Op,
+            L0,
+            L1,
+            L2,
+            L3,
+            L4,
+            L5,
+            L6,
+            L7,
+            L8,
+            L9,
+            L10,
+            L11,
+            L12,
+        > Eval13At<OutputItem, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+            for $expr<InputExpr, InputItem, Op>
+        where
+            InputItem: CubeType + 'static,
+            OutputItem: CubeType + 'static,
+            L0: CubePrimitive + cubecl::frontend::Scalar,
+            L1: CubePrimitive + cubecl::frontend::Scalar,
+            L2: CubePrimitive + cubecl::frontend::Scalar,
+            L3: CubePrimitive + cubecl::frontend::Scalar,
+            L4: CubePrimitive + cubecl::frontend::Scalar,
+            L5: CubePrimitive + cubecl::frontend::Scalar,
+            L6: CubePrimitive + cubecl::frontend::Scalar,
+            L7: CubePrimitive + cubecl::frontend::Scalar,
+            L8: CubePrimitive + cubecl::frontend::Scalar,
+            L9: CubePrimitive + cubecl::frontend::Scalar,
+            L10: CubePrimitive + cubecl::frontend::Scalar,
+            L11: CubePrimitive + cubecl::frontend::Scalar,
+            L12: CubePrimitive + cubecl::frontend::Scalar,
+            InputExpr: Eval13At<InputItem, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+            Op: $op<InputItem, Output = OutputItem>,
+        {
+            fn eval13_at(
+                slot0: &[L0],
+                slot1: &[L1],
+                slot2: &[L2],
+                slot3: &[L3],
+                slot4: &[L4],
+                slot5: &[L5],
+                slot6: &[L6],
+                slot7: &[L7],
+                slot8: &[L8],
+                slot9: &[L9],
+                slot10: &[L10],
+                slot11: &[L11],
+                slot12: &[L12],
+                slot_offsets: &[u32],
+                offset_base: usize,
+                $index: usize,
+            ) -> OutputItem {
+                let $input = InputExpr::eval13_at(
+                    slot0,
+                    slot1,
+                    slot2,
+                    slot3,
+                    slot4,
+                    slot5,
+                    slot6,
+                    slot7,
+                    slot8,
+                    slot9,
+                    slot10,
+                    slot11,
+                    slot12,
+                    slot_offsets,
+                    offset_base,
+                    $index,
+                );
+                $body
+            }
+        }
+    };
+}
+
+impl_unary_eval13_at!(TransformExpr, UnaryOp, input, index; Op::apply(input));
+impl_unary_eval13_at!(IndexedTransformExpr, IndexedUnaryOp, input, index; Op::apply(input, index as u32));
+
+#[cubecl::cube]
+impl<InputItem, OutputItem, InputExpr, Op, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+    Eval13At<OutputItem, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+    for AdjacentIndexedTransformExpr<InputExpr, InputItem, Op>
+where
+    InputItem: CubeType + 'static,
+    OutputItem: CubeType + 'static,
+    L0: CubePrimitive + cubecl::frontend::Scalar,
+    L1: CubePrimitive + cubecl::frontend::Scalar,
+    L2: CubePrimitive + cubecl::frontend::Scalar,
+    L3: CubePrimitive + cubecl::frontend::Scalar,
+    L4: CubePrimitive + cubecl::frontend::Scalar,
+    L5: CubePrimitive + cubecl::frontend::Scalar,
+    L6: CubePrimitive + cubecl::frontend::Scalar,
+    L7: CubePrimitive + cubecl::frontend::Scalar,
+    L8: CubePrimitive + cubecl::frontend::Scalar,
+    L9: CubePrimitive + cubecl::frontend::Scalar,
+    L10: CubePrimitive + cubecl::frontend::Scalar,
+    L11: CubePrimitive + cubecl::frontend::Scalar,
+    L12: CubePrimitive + cubecl::frontend::Scalar,
+    InputExpr: Eval13At<InputItem, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+    Op: IndexedBinaryOp<InputItem, Output = OutputItem>,
+{
+    fn eval13_at(
+        slot0: &[L0],
+        slot1: &[L1],
+        slot2: &[L2],
+        slot3: &[L3],
+        slot4: &[L4],
+        slot5: &[L5],
+        slot6: &[L6],
+        slot7: &[L7],
+        slot8: &[L8],
+        slot9: &[L9],
+        slot10: &[L10],
+        slot11: &[L11],
+        slot12: &[L12],
+        slot_offsets: &[u32],
+        offset_base: usize,
+        index: usize,
+    ) -> OutputItem {
+        let previous_index = if index == 0usize {
+            0usize
+        } else {
+            index - 1usize
+        };
+        let previous = InputExpr::eval13_at(
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            offset_base,
+            previous_index,
+        );
+        let current = InputExpr::eval13_at(
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            offset_base,
+            index,
+        );
+        Op::apply(previous, current, index as u32)
+    }
+}
+
+#[cubecl::cube]
+impl<Item, InputExpr, Op, Layout, Leaves, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+    Eval13At<Item, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+    for AdjacentExpr<InputExpr, Item, Op, Layout, Leaves>
+where
+    Item: CubeType + 'static,
+    L0: CubePrimitive + cubecl::frontend::Scalar,
+    L1: CubePrimitive + cubecl::frontend::Scalar,
+    L2: CubePrimitive + cubecl::frontend::Scalar,
+    L3: CubePrimitive + cubecl::frontend::Scalar,
+    L4: CubePrimitive + cubecl::frontend::Scalar,
+    L5: CubePrimitive + cubecl::frontend::Scalar,
+    L6: CubePrimitive + cubecl::frontend::Scalar,
+    L7: CubePrimitive + cubecl::frontend::Scalar,
+    L8: CubePrimitive + cubecl::frontend::Scalar,
+    L9: CubePrimitive + cubecl::frontend::Scalar,
+    L10: CubePrimitive + cubecl::frontend::Scalar,
+    L11: CubePrimitive + cubecl::frontend::Scalar,
+    L12: CubePrimitive + cubecl::frontend::Scalar,
+    InputExpr: Eval13At<Item, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+    Op: ReductionOp<Item>,
+    Leaves: CubeType + SelectLeaves + 'static,
+    Layout: Decompose<Item, Leaves = Leaves> + Recompose<Item, Leaves = Leaves>,
+{
+    fn eval13_at(
+        slot0: &[L0],
+        slot1: &[L1],
+        slot2: &[L2],
+        slot3: &[L3],
+        slot4: &[L4],
+        slot5: &[L5],
+        slot6: &[L6],
+        slot7: &[L7],
+        slot8: &[L8],
+        slot9: &[L9],
+        slot10: &[L10],
+        slot11: &[L11],
+        slot12: &[L12],
+        slot_offsets: &[u32],
+        offset_base: usize,
+        index: usize,
+    ) -> Item {
+        let previous_index = if index == 0usize {
+            0usize
+        } else {
+            index - 1usize
+        };
+        let first = Layout::decompose(InputExpr::eval13_at(
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            offset_base,
+            index,
+        ));
+        let adjacent = Layout::decompose(Op::apply(
+            InputExpr::eval13_at(
+                slot0,
+                slot1,
+                slot2,
+                slot3,
+                slot4,
+                slot5,
+                slot6,
+                slot7,
+                slot8,
+                slot9,
+                slot10,
+                slot11,
+                slot12,
+                slot_offsets,
+                offset_base,
+                previous_index,
+            ),
+            InputExpr::eval13_at(
+                slot0,
+                slot1,
+                slot2,
+                slot3,
+                slot4,
+                slot5,
+                slot6,
+                slot7,
+                slot8,
+                slot9,
+                slot10,
+                slot11,
+                slot12,
+                slot_offsets,
+                offset_base,
+                index,
+            ),
+        ));
+        Layout::recompose(Leaves::select(index == 0usize, first, adjacent))
+    }
+}
+
+#[cubecl::cube]
+impl<Item, ValuesExpr, IndicesExpr, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+    Eval13At<Item, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+    for PermuteExpr<ValuesExpr, IndicesExpr>
+where
+    Item: CubeType + 'static,
+    L0: CubePrimitive + cubecl::frontend::Scalar,
+    L1: CubePrimitive + cubecl::frontend::Scalar,
+    L2: CubePrimitive + cubecl::frontend::Scalar,
+    L3: CubePrimitive + cubecl::frontend::Scalar,
+    L4: CubePrimitive + cubecl::frontend::Scalar,
+    L5: CubePrimitive + cubecl::frontend::Scalar,
+    L6: CubePrimitive + cubecl::frontend::Scalar,
+    L7: CubePrimitive + cubecl::frontend::Scalar,
+    L8: CubePrimitive + cubecl::frontend::Scalar,
+    L9: CubePrimitive + cubecl::frontend::Scalar,
+    L10: CubePrimitive + cubecl::frontend::Scalar,
+    L11: CubePrimitive + cubecl::frontend::Scalar,
+    L12: CubePrimitive + cubecl::frontend::Scalar,
+    ValuesExpr: Eval13At<Item, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+    IndicesExpr: Eval13At<crate::MIndex, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+{
+    fn eval13_at(
+        slot0: &[L0],
+        slot1: &[L1],
+        slot2: &[L2],
+        slot3: &[L3],
+        slot4: &[L4],
+        slot5: &[L5],
+        slot6: &[L6],
+        slot7: &[L7],
+        slot8: &[L8],
+        slot9: &[L9],
+        slot10: &[L10],
+        slot11: &[L11],
+        slot12: &[L12],
+        slot_offsets: &[u32],
+        offset_base: usize,
+        index: usize,
+    ) -> Item {
+        let gathered = IndicesExpr::eval13_at(
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            offset_base,
+            index,
+        );
+        ValuesExpr::eval13_at(
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            offset_base,
+            gathered as usize,
+        )
+    }
+}
+
+#[cubecl::cube]
+impl<Item, InputExpr, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+    Eval13At<Item, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12> for RepeatExpr<InputExpr>
+where
+    Item: CubeType + 'static,
+    L0: CubePrimitive + cubecl::frontend::Scalar,
+    L1: CubePrimitive + cubecl::frontend::Scalar,
+    L2: CubePrimitive + cubecl::frontend::Scalar,
+    L3: CubePrimitive + cubecl::frontend::Scalar,
+    L4: CubePrimitive + cubecl::frontend::Scalar,
+    L5: CubePrimitive + cubecl::frontend::Scalar,
+    L6: CubePrimitive + cubecl::frontend::Scalar,
+    L7: CubePrimitive + cubecl::frontend::Scalar,
+    L8: CubePrimitive + cubecl::frontend::Scalar,
+    L9: CubePrimitive + cubecl::frontend::Scalar,
+    L10: CubePrimitive + cubecl::frontend::Scalar,
+    L11: CubePrimitive + cubecl::frontend::Scalar,
+    L12: CubePrimitive + cubecl::frontend::Scalar,
+    InputExpr: Eval13At<Item, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+{
+    fn eval13_at(
+        slot0: &[L0],
+        slot1: &[L1],
+        slot2: &[L2],
+        slot3: &[L3],
+        slot4: &[L4],
+        slot5: &[L5],
+        slot6: &[L6],
+        slot7: &[L7],
+        slot8: &[L8],
+        slot9: &[L9],
+        slot10: &[L10],
+        slot11: &[L11],
+        slot12: &[L12],
+        slot_offsets: &[u32],
+        offset_base: usize,
+        _index: usize,
+    ) -> Item {
+        InputExpr::eval13_at(
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            offset_base,
+            0usize,
+        )
+    }
+}
 
 /// Binds a segmented row to the same staged leaves used by its backing value
 /// expression.  There is one implementation per total read arity, not per
@@ -409,7 +1003,7 @@ macro_rules! impl_segment_iterator_eval {
             for SegmentIteratorExpr<ValuesExpr, OffsetsExpr>
         where
             Item: CubeType + Send + Sync + 'static,
-            $( $leaf: CubePrimitive + 'static, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar + 'static, )+
             ValuesExpr: $trait_name<Item, $( $leaf ),+>,
             OffsetsExpr: $trait_name<u32, $( $leaf ),+>,
         {
@@ -463,19 +1057,154 @@ macro_rules! impl_segment_iterator_eval {
     };
 }
 
-impl_segment_iterator_eval!(Eval1, eval1, __expand_eval1; L0: slot0);
-impl_segment_iterator_eval!(Eval2, eval2, __expand_eval2; L0: slot0, L1: slot1);
-impl_segment_iterator_eval!(Eval3, eval3, __expand_eval3; L0: slot0, L1: slot1, L2: slot2);
-impl_segment_iterator_eval!(Eval4, eval4, __expand_eval4; L0: slot0, L1: slot1, L2: slot2, L3: slot3);
-impl_segment_iterator_eval!(Eval5, eval5, __expand_eval5; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4);
-impl_segment_iterator_eval!(Eval6, eval6, __expand_eval6; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5);
-impl_segment_iterator_eval!(Eval7, eval7, __expand_eval7; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6);
-impl_segment_iterator_eval!(Eval8, eval8, __expand_eval8; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7);
-impl_segment_iterator_eval!(Eval9, eval9, __expand_eval9; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8);
-impl_segment_iterator_eval!(Eval10, eval10, __expand_eval10; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8, L9: slot9);
-impl_segment_iterator_eval!(Eval11, eval11, __expand_eval11; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8, L9: slot9, L10: slot10);
-impl_segment_iterator_eval!(Eval12, eval12, __expand_eval12; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8, L9: slot9, L10: slot10, L11: slot11);
 impl_segment_iterator_eval!(Eval13, eval13, __expand_eval13; L0: slot0, L1: slot1, L2: slot2, L3: slot3, L4: slot4, L5: slot5, L6: slot6, L7: slot7, L8: slot8, L9: slot9, L10: slot10, L11: slot11, L12: slot12);
+
+impl<Item, ValuesExpr, OffsetsExpr, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+    Eval13At<Segment<Item>, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>
+    for SegmentIteratorExpr<ValuesExpr, OffsetsExpr>
+where
+    Item: CubeType + Send + Sync + 'static,
+    L0: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L1: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L2: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L3: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L4: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L5: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L6: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L7: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L8: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L9: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L10: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L11: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    L12: CubePrimitive + cubecl::frontend::Scalar + 'static,
+    ValuesExpr: Eval13At<Item, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+    OffsetsExpr: Eval13At<u32, L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>,
+{
+    fn eval13_at(
+        slot0: &[L0],
+        slot1: &[L1],
+        slot2: &[L2],
+        slot3: &[L3],
+        slot4: &[L4],
+        slot5: &[L5],
+        slot6: &[L6],
+        slot7: &[L7],
+        slot8: &[L8],
+        slot9: &[L9],
+        slot10: &[L10],
+        slot11: &[L11],
+        slot12: &[L12],
+        _slot_offsets: &[u32],
+        _offset_base: usize,
+        _index: usize,
+    ) -> Segment<Item> {
+        let _ = (
+            slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11,
+            slot12,
+        );
+        unreachable!("segments are constructed while CubeCL expands a kernel")
+    }
+
+    fn __expand_eval13_at(
+        scope: &Scope,
+        slot0: &<[L0] as CubeType>::ExpandType,
+        slot1: &<[L1] as CubeType>::ExpandType,
+        slot2: &<[L2] as CubeType>::ExpandType,
+        slot3: &<[L3] as CubeType>::ExpandType,
+        slot4: &<[L4] as CubeType>::ExpandType,
+        slot5: &<[L5] as CubeType>::ExpandType,
+        slot6: &<[L6] as CubeType>::ExpandType,
+        slot7: &<[L7] as CubeType>::ExpandType,
+        slot8: &<[L8] as CubeType>::ExpandType,
+        slot9: &<[L9] as CubeType>::ExpandType,
+        slot10: &<[L10] as CubeType>::ExpandType,
+        slot11: &<[L11] as CubeType>::ExpandType,
+        slot12: &<[L12] as CubeType>::ExpandType,
+        slot_offsets: &<[u32] as CubeType>::ExpandType,
+        offset_base: <usize as CubeType>::ExpandType,
+        index: <usize as CubeType>::ExpandType,
+    ) -> <Segment<Item> as CubeType>::ExpandType {
+        let next_index = ExpandTypeClone::clone_unchecked(&index)
+            .__expand_add_method(scope, NativeExpand::from_lit(scope, 1usize));
+        let start = OffsetsExpr::__expand_eval13_at(
+            scope,
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            ExpandTypeClone::clone_unchecked(&offset_base),
+            ExpandTypeClone::clone_unchecked(&index),
+        );
+        let end = OffsetsExpr::__expand_eval13_at(
+            scope,
+            slot0,
+            slot1,
+            slot2,
+            slot3,
+            slot4,
+            slot5,
+            slot6,
+            slot7,
+            slot8,
+            slot9,
+            slot10,
+            slot11,
+            slot12,
+            slot_offsets,
+            ExpandTypeClone::clone_unchecked(&offset_base),
+            next_index,
+        );
+
+        let slot0 = ExpandTypeClone::clone_unchecked(slot0);
+        let slot1 = ExpandTypeClone::clone_unchecked(slot1);
+        let slot2 = ExpandTypeClone::clone_unchecked(slot2);
+        let slot3 = ExpandTypeClone::clone_unchecked(slot3);
+        let slot4 = ExpandTypeClone::clone_unchecked(slot4);
+        let slot5 = ExpandTypeClone::clone_unchecked(slot5);
+        let slot6 = ExpandTypeClone::clone_unchecked(slot6);
+        let slot7 = ExpandTypeClone::clone_unchecked(slot7);
+        let slot8 = ExpandTypeClone::clone_unchecked(slot8);
+        let slot9 = ExpandTypeClone::clone_unchecked(slot9);
+        let slot10 = ExpandTypeClone::clone_unchecked(slot10);
+        let slot11 = ExpandTypeClone::clone_unchecked(slot11);
+        let slot12 = ExpandTypeClone::clone_unchecked(slot12);
+        let slot_offsets = ExpandTypeClone::clone_unchecked(slot_offsets);
+        let offset_base = ExpandTypeClone::clone_unchecked(&offset_base);
+        let reader: SegmentReader<Item> = Rc::new(move |scope, absolute| {
+            let absolute = <usize as Cast>::__expand_cast_from(scope, absolute);
+            ValuesExpr::__expand_eval13_at(
+                scope,
+                &slot0,
+                &slot1,
+                &slot2,
+                &slot3,
+                &slot4,
+                &slot5,
+                &slot6,
+                &slot7,
+                &slot8,
+                &slot9,
+                &slot10,
+                &slot11,
+                &slot12,
+                &slot_offsets,
+                ExpandTypeClone::clone_unchecked(&offset_base),
+                absolute,
+            )
+        });
+        SegmentExpand::from_bounds(scope, reader, start, end)
+    }
+}
 
 macro_rules! impl_slot_eval {
     (
@@ -488,7 +1217,7 @@ macro_rules! impl_slot_eval {
         #[cubecl::cube]
         impl<Mode, $( $generic ),+> $trait_name<T, $( $leaf_ty ),+> for $slot_expr<T, Mode>
         where
-            $( $generic: CubePrimitive, )+
+            $( $generic: CubePrimitive + cubecl::frontend::Scalar, )+
             Mode: ReadMode<T>,
         {
             fn $method(
@@ -503,91 +1232,6 @@ macro_rules! impl_slot_eval {
     };
 }
 
-impl_slot_eval!(Eval1, eval1, Slot0, 0; <T>; [T]; [slot0]; slot0);
-
-impl_slot_eval!(Eval2, eval2, Slot0, 0; <T, L1>; [T, L1]; [slot0, slot1]; slot0);
-impl_slot_eval!(Eval2, eval2, Slot1, 1; <L0, T>; [L0, T]; [slot0, slot1]; slot1);
-
-impl_slot_eval!(Eval3, eval3, Slot0, 0; <T, L1, L2>; [T, L1, L2]; [slot0, slot1, slot2]; slot0);
-impl_slot_eval!(Eval3, eval3, Slot1, 1; <L0, T, L2>; [L0, T, L2]; [slot0, slot1, slot2]; slot1);
-impl_slot_eval!(Eval3, eval3, Slot2, 2; <L0, L1, T>; [L0, L1, T]; [slot0, slot1, slot2]; slot2);
-
-impl_slot_eval!(Eval4, eval4, Slot0, 0; <T, L1, L2, L3>; [T, L1, L2, L3]; [slot0, slot1, slot2, slot3]; slot0);
-impl_slot_eval!(Eval4, eval4, Slot1, 1; <L0, T, L2, L3>; [L0, T, L2, L3]; [slot0, slot1, slot2, slot3]; slot1);
-impl_slot_eval!(Eval4, eval4, Slot2, 2; <L0, L1, T, L3>; [L0, L1, T, L3]; [slot0, slot1, slot2, slot3]; slot2);
-impl_slot_eval!(Eval4, eval4, Slot3, 3; <L0, L1, L2, T>; [L0, L1, L2, T]; [slot0, slot1, slot2, slot3]; slot3);
-
-impl_slot_eval!(Eval5, eval5, Slot0, 0; <T, L1, L2, L3, L4>; [T, L1, L2, L3, L4]; [slot0, slot1, slot2, slot3, slot4]; slot0);
-impl_slot_eval!(Eval5, eval5, Slot1, 1; <L0, T, L2, L3, L4>; [L0, T, L2, L3, L4]; [slot0, slot1, slot2, slot3, slot4]; slot1);
-impl_slot_eval!(Eval5, eval5, Slot2, 2; <L0, L1, T, L3, L4>; [L0, L1, T, L3, L4]; [slot0, slot1, slot2, slot3, slot4]; slot2);
-impl_slot_eval!(Eval5, eval5, Slot3, 3; <L0, L1, L2, T, L4>; [L0, L1, L2, T, L4]; [slot0, slot1, slot2, slot3, slot4]; slot3);
-impl_slot_eval!(Eval5, eval5, Slot4, 4; <L0, L1, L2, L3, T>; [L0, L1, L2, L3, T]; [slot0, slot1, slot2, slot3, slot4]; slot4);
-
-impl_slot_eval!(Eval6, eval6, Slot0, 0; <T, L1, L2, L3, L4, L5>; [T, L1, L2, L3, L4, L5]; [slot0, slot1, slot2, slot3, slot4, slot5]; slot0);
-impl_slot_eval!(Eval6, eval6, Slot1, 1; <L0, T, L2, L3, L4, L5>; [L0, T, L2, L3, L4, L5]; [slot0, slot1, slot2, slot3, slot4, slot5]; slot1);
-impl_slot_eval!(Eval6, eval6, Slot2, 2; <L0, L1, T, L3, L4, L5>; [L0, L1, T, L3, L4, L5]; [slot0, slot1, slot2, slot3, slot4, slot5]; slot2);
-impl_slot_eval!(Eval6, eval6, Slot3, 3; <L0, L1, L2, T, L4, L5>; [L0, L1, L2, T, L4, L5]; [slot0, slot1, slot2, slot3, slot4, slot5]; slot3);
-impl_slot_eval!(Eval6, eval6, Slot4, 4; <L0, L1, L2, L3, T, L5>; [L0, L1, L2, L3, T, L5]; [slot0, slot1, slot2, slot3, slot4, slot5]; slot4);
-impl_slot_eval!(Eval6, eval6, Slot5, 5; <L0, L1, L2, L3, L4, T>; [L0, L1, L2, L3, L4, T]; [slot0, slot1, slot2, slot3, slot4, slot5]; slot5);
-
-impl_slot_eval!(Eval7, eval7, Slot0, 0; <T, L1, L2, L3, L4, L5, L6>; [T, L1, L2, L3, L4, L5, L6]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6]; slot0);
-impl_slot_eval!(Eval7, eval7, Slot1, 1; <L0, T, L2, L3, L4, L5, L6>; [L0, T, L2, L3, L4, L5, L6]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6]; slot1);
-impl_slot_eval!(Eval7, eval7, Slot2, 2; <L0, L1, T, L3, L4, L5, L6>; [L0, L1, T, L3, L4, L5, L6]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6]; slot2);
-impl_slot_eval!(Eval7, eval7, Slot3, 3; <L0, L1, L2, T, L4, L5, L6>; [L0, L1, L2, T, L4, L5, L6]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6]; slot3);
-impl_slot_eval!(Eval7, eval7, Slot4, 4; <L0, L1, L2, L3, T, L5, L6>; [L0, L1, L2, L3, T, L5, L6]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6]; slot4);
-impl_slot_eval!(Eval7, eval7, Slot5, 5; <L0, L1, L2, L3, L4, T, L6>; [L0, L1, L2, L3, L4, T, L6]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6]; slot5);
-impl_slot_eval!(Eval7, eval7, Slot6, 6; <L0, L1, L2, L3, L4, L5, T>; [L0, L1, L2, L3, L4, L5, T]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6]; slot6);
-
-impl_slot_eval!(Eval8, eval8, Slot0, 0; <T, L1, L2, L3, L4, L5, L6, L7>; [T, L1, L2, L3, L4, L5, L6, L7]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7]; slot0);
-impl_slot_eval!(Eval8, eval8, Slot1, 1; <L0, T, L2, L3, L4, L5, L6, L7>; [L0, T, L2, L3, L4, L5, L6, L7]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7]; slot1);
-impl_slot_eval!(Eval8, eval8, Slot2, 2; <L0, L1, T, L3, L4, L5, L6, L7>; [L0, L1, T, L3, L4, L5, L6, L7]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7]; slot2);
-impl_slot_eval!(Eval8, eval8, Slot3, 3; <L0, L1, L2, T, L4, L5, L6, L7>; [L0, L1, L2, T, L4, L5, L6, L7]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7]; slot3);
-impl_slot_eval!(Eval8, eval8, Slot4, 4; <L0, L1, L2, L3, T, L5, L6, L7>; [L0, L1, L2, L3, T, L5, L6, L7]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7]; slot4);
-impl_slot_eval!(Eval8, eval8, Slot5, 5; <L0, L1, L2, L3, L4, T, L6, L7>; [L0, L1, L2, L3, L4, T, L6, L7]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7]; slot5);
-impl_slot_eval!(Eval8, eval8, Slot6, 6; <L0, L1, L2, L3, L4, L5, T, L7>; [L0, L1, L2, L3, L4, L5, T, L7]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7]; slot6);
-impl_slot_eval!(Eval8, eval8, Slot7, 7; <L0, L1, L2, L3, L4, L5, L6, T>; [L0, L1, L2, L3, L4, L5, L6, T]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7]; slot7);
-impl_slot_eval!(Eval9, eval9, Slot0, 0; <T, L1, L2, L3, L4, L5, L6, L7, L8>; [T, L1, L2, L3, L4, L5, L6, L7, L8]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8]; slot0);
-impl_slot_eval!(Eval9, eval9, Slot1, 1; <L0, T, L2, L3, L4, L5, L6, L7, L8>; [L0, T, L2, L3, L4, L5, L6, L7, L8]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8]; slot1);
-impl_slot_eval!(Eval9, eval9, Slot2, 2; <L0, L1, T, L3, L4, L5, L6, L7, L8>; [L0, L1, T, L3, L4, L5, L6, L7, L8]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8]; slot2);
-impl_slot_eval!(Eval9, eval9, Slot3, 3; <L0, L1, L2, T, L4, L5, L6, L7, L8>; [L0, L1, L2, T, L4, L5, L6, L7, L8]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8]; slot3);
-impl_slot_eval!(Eval9, eval9, Slot4, 4; <L0, L1, L2, L3, T, L5, L6, L7, L8>; [L0, L1, L2, L3, T, L5, L6, L7, L8]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8]; slot4);
-impl_slot_eval!(Eval9, eval9, Slot5, 5; <L0, L1, L2, L3, L4, T, L6, L7, L8>; [L0, L1, L2, L3, L4, T, L6, L7, L8]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8]; slot5);
-impl_slot_eval!(Eval9, eval9, Slot6, 6; <L0, L1, L2, L3, L4, L5, T, L7, L8>; [L0, L1, L2, L3, L4, L5, T, L7, L8]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8]; slot6);
-impl_slot_eval!(Eval9, eval9, Slot7, 7; <L0, L1, L2, L3, L4, L5, L6, T, L8>; [L0, L1, L2, L3, L4, L5, L6, T, L8]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8]; slot7);
-impl_slot_eval!(Eval9, eval9, Slot8, 8; <L0, L1, L2, L3, L4, L5, L6, L7, T>; [L0, L1, L2, L3, L4, L5, L6, L7, T]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8]; slot8);
-impl_slot_eval!(Eval10, eval10, Slot0, 0; <T, L1, L2, L3, L4, L5, L6, L7, L8, L9>; [T, L1, L2, L3, L4, L5, L6, L7, L8, L9]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot0);
-impl_slot_eval!(Eval10, eval10, Slot1, 1; <L0, T, L2, L3, L4, L5, L6, L7, L8, L9>; [L0, T, L2, L3, L4, L5, L6, L7, L8, L9]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot1);
-impl_slot_eval!(Eval10, eval10, Slot2, 2; <L0, L1, T, L3, L4, L5, L6, L7, L8, L9>; [L0, L1, T, L3, L4, L5, L6, L7, L8, L9]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot2);
-impl_slot_eval!(Eval10, eval10, Slot3, 3; <L0, L1, L2, T, L4, L5, L6, L7, L8, L9>; [L0, L1, L2, T, L4, L5, L6, L7, L8, L9]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot3);
-impl_slot_eval!(Eval10, eval10, Slot4, 4; <L0, L1, L2, L3, T, L5, L6, L7, L8, L9>; [L0, L1, L2, L3, T, L5, L6, L7, L8, L9]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot4);
-impl_slot_eval!(Eval10, eval10, Slot5, 5; <L0, L1, L2, L3, L4, T, L6, L7, L8, L9>; [L0, L1, L2, L3, L4, T, L6, L7, L8, L9]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot5);
-impl_slot_eval!(Eval10, eval10, Slot6, 6; <L0, L1, L2, L3, L4, L5, T, L7, L8, L9>; [L0, L1, L2, L3, L4, L5, T, L7, L8, L9]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot6);
-impl_slot_eval!(Eval10, eval10, Slot7, 7; <L0, L1, L2, L3, L4, L5, L6, T, L8, L9>; [L0, L1, L2, L3, L4, L5, L6, T, L8, L9]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot7);
-impl_slot_eval!(Eval10, eval10, Slot8, 8; <L0, L1, L2, L3, L4, L5, L6, L7, T, L9>; [L0, L1, L2, L3, L4, L5, L6, L7, T, L9]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot8);
-impl_slot_eval!(Eval10, eval10, Slot9, 9; <L0, L1, L2, L3, L4, L5, L6, L7, L8, T>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, T]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9]; slot9);
-impl_slot_eval!(Eval11, eval11, Slot0, 0; <T, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10>; [T, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot0);
-impl_slot_eval!(Eval11, eval11, Slot1, 1; <L0, T, L2, L3, L4, L5, L6, L7, L8, L9, L10>; [L0, T, L2, L3, L4, L5, L6, L7, L8, L9, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot1);
-impl_slot_eval!(Eval11, eval11, Slot2, 2; <L0, L1, T, L3, L4, L5, L6, L7, L8, L9, L10>; [L0, L1, T, L3, L4, L5, L6, L7, L8, L9, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot2);
-impl_slot_eval!(Eval11, eval11, Slot3, 3; <L0, L1, L2, T, L4, L5, L6, L7, L8, L9, L10>; [L0, L1, L2, T, L4, L5, L6, L7, L8, L9, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot3);
-impl_slot_eval!(Eval11, eval11, Slot4, 4; <L0, L1, L2, L3, T, L5, L6, L7, L8, L9, L10>; [L0, L1, L2, L3, T, L5, L6, L7, L8, L9, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot4);
-impl_slot_eval!(Eval11, eval11, Slot5, 5; <L0, L1, L2, L3, L4, T, L6, L7, L8, L9, L10>; [L0, L1, L2, L3, L4, T, L6, L7, L8, L9, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot5);
-impl_slot_eval!(Eval11, eval11, Slot6, 6; <L0, L1, L2, L3, L4, L5, T, L7, L8, L9, L10>; [L0, L1, L2, L3, L4, L5, T, L7, L8, L9, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot6);
-impl_slot_eval!(Eval11, eval11, Slot7, 7; <L0, L1, L2, L3, L4, L5, L6, T, L8, L9, L10>; [L0, L1, L2, L3, L4, L5, L6, T, L8, L9, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot7);
-impl_slot_eval!(Eval11, eval11, Slot8, 8; <L0, L1, L2, L3, L4, L5, L6, L7, T, L9, L10>; [L0, L1, L2, L3, L4, L5, L6, L7, T, L9, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot8);
-impl_slot_eval!(Eval11, eval11, Slot9, 9; <L0, L1, L2, L3, L4, L5, L6, L7, L8, T, L10>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, T, L10]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot9);
-impl_slot_eval!(Eval11, eval11, Slot10, 10; <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, T>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, T]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10]; slot10);
-impl_slot_eval!(Eval12, eval12, Slot0, 0; <T, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11>; [T, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot0);
-impl_slot_eval!(Eval12, eval12, Slot1, 1; <L0, T, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11>; [L0, T, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot1);
-impl_slot_eval!(Eval12, eval12, Slot2, 2; <L0, L1, T, L3, L4, L5, L6, L7, L8, L9, L10, L11>; [L0, L1, T, L3, L4, L5, L6, L7, L8, L9, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot2);
-impl_slot_eval!(Eval12, eval12, Slot3, 3; <L0, L1, L2, T, L4, L5, L6, L7, L8, L9, L10, L11>; [L0, L1, L2, T, L4, L5, L6, L7, L8, L9, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot3);
-impl_slot_eval!(Eval12, eval12, Slot4, 4; <L0, L1, L2, L3, T, L5, L6, L7, L8, L9, L10, L11>; [L0, L1, L2, L3, T, L5, L6, L7, L8, L9, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot4);
-impl_slot_eval!(Eval12, eval12, Slot5, 5; <L0, L1, L2, L3, L4, T, L6, L7, L8, L9, L10, L11>; [L0, L1, L2, L3, L4, T, L6, L7, L8, L9, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot5);
-impl_slot_eval!(Eval12, eval12, Slot6, 6; <L0, L1, L2, L3, L4, L5, T, L7, L8, L9, L10, L11>; [L0, L1, L2, L3, L4, L5, T, L7, L8, L9, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot6);
-impl_slot_eval!(Eval12, eval12, Slot7, 7; <L0, L1, L2, L3, L4, L5, L6, T, L8, L9, L10, L11>; [L0, L1, L2, L3, L4, L5, L6, T, L8, L9, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot7);
-impl_slot_eval!(Eval12, eval12, Slot8, 8; <L0, L1, L2, L3, L4, L5, L6, L7, T, L9, L10, L11>; [L0, L1, L2, L3, L4, L5, L6, L7, T, L9, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot8);
-impl_slot_eval!(Eval12, eval12, Slot9, 9; <L0, L1, L2, L3, L4, L5, L6, L7, L8, T, L10, L11>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, T, L10, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot9);
-impl_slot_eval!(Eval12, eval12, Slot10, 10; <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, T, L11>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, T, L11]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot10);
-impl_slot_eval!(Eval12, eval12, Slot11, 11; <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, T>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, T]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11]; slot11);
 impl_slot_eval!(Eval13, eval13, Slot0, 0; <T, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>; [T, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot0);
 impl_slot_eval!(Eval13, eval13, Slot1, 1; <L0, T, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>; [L0, T, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot1);
 impl_slot_eval!(Eval13, eval13, Slot2, 2; <L0, L1, T, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>; [L0, L1, T, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot2);
@@ -601,3 +1245,44 @@ impl_slot_eval!(Eval13, eval13, Slot9, 9; <L0, L1, L2, L3, L4, L5, L6, L7, L8, T
 impl_slot_eval!(Eval13, eval13, Slot10, 10; <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, T, L11, L12>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, T, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot10);
 impl_slot_eval!(Eval13, eval13, Slot11, 11; <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, T, L12>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, T, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot11);
 impl_slot_eval!(Eval13, eval13, Slot12, 12; <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, T>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, T]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot12);
+
+macro_rules! impl_slot_eval13_at {
+    (
+        $slot_expr:ident, $offset_index:literal;
+        <$( $generic:ident ),+>;
+        [$( $leaf_ty:ty ),+];
+        [$( $slot:ident ),+];
+        $selected:ident
+    ) => {
+        #[cubecl::cube]
+        impl<Mode, $( $generic ),+> Eval13At<T, $( $leaf_ty ),+> for $slot_expr<T, Mode>
+        where
+            $( $generic: CubePrimitive + cubecl::frontend::Scalar, )+
+            Mode: ReadMode<T>,
+        {
+            fn eval13_at(
+                $( $slot: &[$leaf_ty], )+
+                slot_offsets: &[u32],
+                offset_base: usize,
+                index: usize,
+            ) -> T {
+                let _ = ($( $slot, )+);
+                Mode::read($selected, slot_offsets[offset_base + $offset_index], index)
+            }
+        }
+    };
+}
+
+impl_slot_eval13_at!(Slot0, 0; <T, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>; [T, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot0);
+impl_slot_eval13_at!(Slot1, 1; <L0, T, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>; [L0, T, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot1);
+impl_slot_eval13_at!(Slot2, 2; <L0, L1, T, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12>; [L0, L1, T, L3, L4, L5, L6, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot2);
+impl_slot_eval13_at!(Slot3, 3; <L0, L1, L2, T, L4, L5, L6, L7, L8, L9, L10, L11, L12>; [L0, L1, L2, T, L4, L5, L6, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot3);
+impl_slot_eval13_at!(Slot4, 4; <L0, L1, L2, L3, T, L5, L6, L7, L8, L9, L10, L11, L12>; [L0, L1, L2, L3, T, L5, L6, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot4);
+impl_slot_eval13_at!(Slot5, 5; <L0, L1, L2, L3, L4, T, L6, L7, L8, L9, L10, L11, L12>; [L0, L1, L2, L3, L4, T, L6, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot5);
+impl_slot_eval13_at!(Slot6, 6; <L0, L1, L2, L3, L4, L5, T, L7, L8, L9, L10, L11, L12>; [L0, L1, L2, L3, L4, L5, T, L7, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot6);
+impl_slot_eval13_at!(Slot7, 7; <L0, L1, L2, L3, L4, L5, L6, T, L8, L9, L10, L11, L12>; [L0, L1, L2, L3, L4, L5, L6, T, L8, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot7);
+impl_slot_eval13_at!(Slot8, 8; <L0, L1, L2, L3, L4, L5, L6, L7, T, L9, L10, L11, L12>; [L0, L1, L2, L3, L4, L5, L6, L7, T, L9, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot8);
+impl_slot_eval13_at!(Slot9, 9; <L0, L1, L2, L3, L4, L5, L6, L7, L8, T, L10, L11, L12>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, T, L10, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot9);
+impl_slot_eval13_at!(Slot10, 10; <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, T, L11, L12>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, T, L11, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot10);
+impl_slot_eval13_at!(Slot11, 11; <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, T, L12>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, T, L12]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot11);
+impl_slot_eval13_at!(Slot12, 12; <L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, T>; [L0, L1, L2, L3, L4, L5, L6, L7, L8, L9, L10, L11, T]; [slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11, slot12]; slot12);

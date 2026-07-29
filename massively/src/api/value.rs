@@ -20,10 +20,10 @@ where
 
 pub(crate) fn into_scratch<R, T>(
     storage: MVec<R, T>,
-) -> <T as crate::allocation::ScratchStorage<R>>::Storage
+) -> <T as crate::core::allocation::ScratchStorage<R>>::Storage
 where
     R: Runtime,
-    T: MAlloc<R> + crate::allocation::ScratchStorage<R>,
+    T: MAlloc<R> + crate::core::allocation::ScratchStorage<R>,
 {
     <T::Dispatch as crate::api::iter::ItemDispatch<R>>::into_scratch(storage)
 }

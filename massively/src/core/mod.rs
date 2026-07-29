@@ -1,7 +1,9 @@
 pub(crate) mod allocation;
 pub(crate) mod arg_reduce;
 pub(crate) mod arity;
+pub(crate) mod bindings;
 pub(crate) mod by_key;
+pub(crate) mod collective;
 pub(crate) mod error;
 pub(crate) mod eval;
 pub(crate) mod expansion;

@@ -5,9 +5,12 @@ use cubecl::prelude::{CubeElement, CubePrimitive};
 /// A scalar that can occupy one physical storage column.
 pub trait MStorageElement:
     CubePrimitive
+    + cubecl::frontend::Scalar
     + CubeElement
-    + crate::StorageLayout<StorageArity = crate::S1, StorageLeaves = crate::storage::Last<Self>>
-    + crate::storage::ReadElement
+    + crate::core::storage::StorageLayout<
+        StorageArity = crate::core::storage::S1,
+        StorageLeaves = crate::core::storage::Last<Self>,
+    > + crate::core::storage::ReadElement
     + Copy
     + Send
     + Sync

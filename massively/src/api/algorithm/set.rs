@@ -2,10 +2,9 @@
 
 use cubecl::prelude::{CubeType, Runtime};
 
-use crate::{
-    Error, Executor, MAlloc, MIndex, MIter, MIterMut, MStorage, MVec, api::iter::MStorageExtent,
-    op::BinaryPredicateOp,
-};
+use crate::api::iter::MStorageExtent;
+use crate::op::BinaryPredicateOp;
+use crate::{Error, Executor, MAlloc, MIndex, MIter, MIterMut, MStorage, MVec};
 
 struct SetOperation<'a, R: Runtime, Left, Right, Less, const MODE: u8> {
     exec: &'a Executor<R>,
@@ -27,7 +26,7 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
         crate::core::set::set(
@@ -62,7 +61,7 @@ macro_rules! set_api {
             let capacity = ($capacity)(left_len, right_len)?;
             let mut output = exec.alloc::<Item>(capacity);
             let len = $into_name(exec, left, right, less, output.slice_mut(..))?;
-            output.set_logical_extent(crate::extent::LogicalExtent::from_device(
+            output.set_logical_extent(crate::core::extent::LogicalExtent::from_device(
                 &len,
                 capacity as usize,
             ));

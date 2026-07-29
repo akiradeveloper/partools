@@ -228,3 +228,231 @@ fn transform_where_writes_a_flat_operation_result() {
     assert_eq!(exec.to_host(&ob).unwrap(), vec![11, 80, 31]);
     assert_eq!(exec.to_host(&oc).unwrap(), vec![101, 70, 301]);
 }
+
+#[test]
+fn controls_compose_over_device_resident_empty_and_partial_extents() {
+    let exec = exec();
+    let len = 1_025usize;
+    let a = exec.to_device(&(0..len as u32).rev().collect::<Vec<_>>());
+    let b = exec.to_device(&vec![2u32; len]);
+    let c = exec.to_device(&vec![3u32; len]);
+    for selected_len in [0usize, 1, 31, 32, 33, 255, 256, 257, 1_023, 1_025] {
+        let flags = exec.to_device(
+            &(0..len)
+                .map(|i| if i < selected_len { 7u32 } else { 0u32 })
+                .collect::<Vec<_>>(),
+        );
+        let selected = copy_where(&exec, nested_input!(a, b, c), flags.slice(..)).unwrap();
+        let n = selected_len as u32;
+        let first_sum = n * (2 * len as u32 - n - 1) / 2;
+        assert_eq!(
+            reduce(&exec, selected.slice(..), (7, 11, 13), SumTriple).unwrap(),
+            (7 + first_sum, 11 + 2 * n, 13 + 3 * n),
+        );
+        let inclusive = inclusive_scan(&exec, selected.slice(..), SumTriple).unwrap();
+        let exclusive = exclusive_scan(&exec, selected.slice(..), (7, 11, 13), SumTriple).unwrap();
+        let (ia, ib, ic) = MStorage::into_columns(inclusive);
+        let (ea, eb, ec) = MStorage::into_columns(exclusive);
+        let mut running = (0u32, 0u32, 0u32);
+        let mut expected_inclusive = [Vec::new(), Vec::new(), Vec::new()];
+        let mut expected_exclusive = [Vec::new(), Vec::new(), Vec::new()];
+        for index in 0..n {
+            expected_exclusive[0].push(7 + running.0);
+            expected_exclusive[1].push(11 + running.1);
+            expected_exclusive[2].push(13 + running.2);
+            running = (
+                running.0 + len as u32 - index - 1,
+                running.1 + 2,
+                running.2 + 3,
+            );
+            expected_inclusive[0].push(running.0);
+            expected_inclusive[1].push(running.1);
+            expected_inclusive[2].push(running.2);
+        }
+        for (column, expected) in [ia, ib, ic].iter().zip(expected_inclusive) {
+            assert_eq!(exec.to_host(column).unwrap(), expected);
+        }
+        for (column, expected) in [ea, eb, ec].iter().zip(expected_exclusive) {
+            assert_eq!(exec.to_host(column).unwrap(), expected);
+        }
+        let (keys, _, _) = MStorage::into_columns(selected.clone());
+        let sorted = radix_sort_by_key(&exec, keys.slice(..), selected.slice(..)).unwrap();
+        let (sa, sb, sc) = MStorage::into_columns(sorted);
+        assert_eq!(
+            exec.to_host(&sa).unwrap(),
+            ((len as u32 - n)..len as u32).collect::<Vec<_>>()
+        );
+        assert_eq!(exec.to_host(&sb).unwrap(), vec![2u32; selected_len]);
+        assert_eq!(exec.to_host(&sc).unwrap(), vec![3u32; selected_len]);
+    }
+}
+
+struct EqualU32;
+struct EvenTriple;
+
+#[cubecl::cube]
+impl BinaryPredicateOp<u32> for EqualU32 {
+    fn apply(lhs: u32, rhs: u32) -> MFlag {
+        massively::flag::from_bool(lhs == rhs)
+    }
+}
+
+#[cubecl::cube]
+impl PredicateOp<Triple> for EvenTriple {
+    fn apply(value: Triple) -> MFlag {
+        massively::flag::from_bool(value.0 % 2u32 == 0u32)
+    }
+}
+
+fn host_triples(exec: &Executor<WgpuRuntime>, rows: MVec<WgpuRuntime, Triple>) -> Vec<Triple> {
+    let (a, b, c) = MStorage::into_columns(rows);
+    exec.to_host(&a)
+        .unwrap()
+        .into_iter()
+        .zip(exec.to_host(&b).unwrap())
+        .zip(exec.to_host(&c).unwrap())
+        .map(|((a, b), c)| (a, b, c))
+        .collect()
+}
+
+#[test]
+fn owned_algorithms_propagate_shared_and_narrowed_device_extents() {
+    let exec = exec();
+    let a = exec.to_device(&[4u32, 3, 2, 1, 0]);
+    let b = exec.to_device(&[40u32, 30, 20, 10, 0]);
+    let c = exec.to_device(&[400u32, 300, 200, 100, 0]);
+    let keys = exec.to_device(&[1u32, 1, 1, 2, 3]);
+    let indices = exec.to_device(&[2u32, 0, 1, 3, 4]);
+    let ascending_keys = exec.to_device(&[2u32, 3, 4, 8, 9]);
+    for count in [0usize, 3] {
+        let flags = exec.to_device(&(0..5).map(|i| u32::from(i < count)).collect::<Vec<_>>());
+        let selected = copy_where(&exec, nested_input!(a, b, c), flags.slice(..)).unwrap();
+        let selected_indices = copy_where(&exec, indices.slice(..), flags.slice(..)).unwrap();
+        assert_eq!(
+            massively::vector::max_element(&exec, selected_indices.slice(..), LessU32).unwrap(),
+            if count == 0 { None } else { Some(0) },
+        );
+        let expected_sorted: Vec<_> = [(2, 20, 200), (3, 30, 300), (4, 40, 400)]
+            .into_iter()
+            .take(count)
+            .collect();
+        assert_eq!(
+            host_triples(&exec, reverse(&exec, selected.slice(..)).unwrap()),
+            expected_sorted
+        );
+        assert_eq!(
+            host_triples(
+                &exec,
+                gather(&exec, nested_input!(a, b, c), selected_indices.slice(..)).unwrap()
+            ),
+            [(2, 20, 200), (4, 40, 400), (3, 30, 300)]
+                .into_iter()
+                .take(count)
+                .collect::<Vec<_>>()
+        );
+        for sorted in [
+            sort_by_key(&exec, a.slice(..), selected.slice(..), LessU32).unwrap(),
+            radix_sort_by_key(&exec, a.slice(..), selected.slice(..)).unwrap(),
+        ] {
+            assert_eq!(host_triples(&exec, sorted), expected_sorted);
+        }
+        let sorted = sort(&exec, selected.slice(..), LessTriple).unwrap();
+        let expected_merged: Vec<_> = expected_sorted.iter().flat_map(|&row| [row, row]).collect();
+        assert_eq!(
+            host_triples(
+                &exec,
+                merge(&exec, sorted.slice(..), sorted.slice(..), LessTriple).unwrap()
+            ),
+            expected_merged
+        );
+        assert_eq!(
+            host_triples(
+                &exec,
+                merge_by_key(
+                    &exec,
+                    ascending_keys.slice(..),
+                    sorted.slice(..),
+                    ascending_keys.slice(..),
+                    sorted.slice(..),
+                    LessU32
+                )
+                .unwrap()
+            ),
+            expected_merged
+        );
+        let (partitioned, boundary) = partition(&exec, selected.slice(..), EvenTriple).unwrap();
+        assert_eq!(boundary, if count == 0 { 0 } else { 2 });
+        assert_eq!(
+            host_triples(&exec, partitioned),
+            [(4, 40, 400), (2, 20, 200), (3, 30, 300)]
+                .into_iter()
+                .take(count)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            host_triples(
+                &exec,
+                inclusive_scan_by_key(
+                    &exec,
+                    keys.slice(..),
+                    selected.slice(..),
+                    EqualU32,
+                    SumTriple
+                )
+                .unwrap()
+            ),
+            [(4, 40, 400), (7, 70, 700), (9, 90, 900)]
+                .into_iter()
+                .take(count)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            host_triples(
+                &exec,
+                exclusive_scan_by_key(
+                    &exec,
+                    keys.slice(..),
+                    selected.slice(..),
+                    EqualU32,
+                    (7, 11, 13),
+                    SumTriple
+                )
+                .unwrap()
+            ),
+            [(7, 11, 13), (11, 51, 413), (14, 81, 713)]
+                .into_iter()
+                .take(count)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            host_triples(
+                &exec,
+                unique_by_key(&exec, keys.slice(..), selected.slice(..), EqualU32).unwrap()
+            ),
+            [(4, 40, 400)]
+                .into_iter()
+                .take(count.min(1))
+                .collect::<Vec<_>>()
+        );
+        let (reduced_keys, reduced) = reduce_by_key(
+            &exec,
+            keys.slice(..),
+            selected.slice(..),
+            EqualU32,
+            (7, 11, 13),
+            SumTriple,
+        )
+        .unwrap();
+        assert_eq!(
+            exec.to_host(&reduced_keys).unwrap(),
+            vec![1u32; count.min(1)]
+        );
+        assert_eq!(
+            host_triples(&exec, reduced),
+            [(16, 101, 913)]
+                .into_iter()
+                .take(count.min(1))
+                .collect::<Vec<_>>()
+        );
+    }
+}

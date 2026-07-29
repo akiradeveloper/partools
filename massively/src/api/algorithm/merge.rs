@@ -2,7 +2,10 @@
 
 use cubecl::prelude::{CubeType, Runtime};
 
-use crate::{Error, Executor, MAlloc, MIter, MIterMut, MStorage, MVec, op::BinaryPredicateOp};
+use crate::api::iter::MStorageExtent;
+use crate::core::extent::LogicalExtent;
+use crate::op::BinaryPredicateOp;
+use crate::{Error, Executor, MAlloc, MIter, MIterMut, MStorage, MVec};
 
 struct MergeOperation<'a, R: Runtime, Left, Right, Less> {
     exec: &'a Executor<R>,
@@ -24,10 +27,10 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        crate::merge::merge_direct(
+        crate::core::merge::merge_direct(
             self.exec,
             crate::api::iter::lower_fixed::<R, _>(self.left),
             crate::api::iter::lower_fixed::<R, _>(self.right),
@@ -62,19 +65,31 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        let control = crate::merge::merge_control_fixed(
+        let left_extent = self
+            .left_keys
+            .logical_extent()?
+            .zipped(&self.left_values.logical_extent()?)?;
+        let right_extent = self
+            .right_keys
+            .logical_extent()?
+            .zipped(&self.right_values.logical_extent()?)?;
+        let control = crate::core::merge::merge_control_fixed(
             self.exec,
-            crate::api::iter::lower_fixed::<R, _>(self.left_keys),
-            crate::api::iter::lower_fixed::<R, _>(self.right_keys),
+            crate::api::iter::lower_fixed::<R, _>(self.left_keys)
+                .with_logical_extent(left_extent.clone()),
+            crate::api::iter::lower_fixed::<R, _>(self.right_keys)
+                .with_logical_extent(right_extent.clone()),
             self.less,
         )?;
-        crate::merge::apply_fixed(
+        crate::core::merge::apply_fixed(
             self.exec,
-            crate::api::iter::lower_fixed::<R, _>(self.left_values),
-            crate::api::iter::lower_fixed::<R, _>(self.right_values),
+            crate::api::iter::lower_fixed::<R, _>(self.left_values)
+                .with_logical_extent(left_extent),
+            crate::api::iter::lower_fixed::<R, _>(self.right_values)
+                .with_logical_extent(right_extent),
             &control,
             output,
         )
@@ -126,8 +141,15 @@ where
         .ok_or(Error::LengthTooLarge {
             len: left_len as usize + right_len as usize,
         })?;
-    let output = exec.alloc::<Item>(len);
+    let extent = LogicalExtent::add(
+        exec,
+        &left.logical_extent()?,
+        &right.logical_extent()?,
+        len as usize,
+    )?;
+    let mut output = exec.alloc::<Item>(len);
     merge_into(exec, left, right, less, output.slice_mut(..))?;
+    output.set_logical_extent(extent);
     Ok(output)
 }
 
@@ -230,7 +252,14 @@ where
         .ok_or(Error::LengthTooLarge {
             len: left_len as usize + right_len as usize,
         })?;
-    let value_output = exec.alloc::<LeftValues::Item>(len);
+    let left_extent = left_keys
+        .logical_extent()?
+        .zipped(&left_values.logical_extent()?)?;
+    let right_extent = right_keys
+        .logical_extent()?
+        .zipped(&right_values.logical_extent()?)?;
+    let extent = LogicalExtent::add(exec, &left_extent, &right_extent, len as usize)?;
+    let mut value_output = exec.alloc::<LeftValues::Item>(len);
     merge_by_key_into(
         exec,
         left_keys,
@@ -240,6 +269,7 @@ where
         less,
         value_output.slice_mut(..),
     )?;
+    value_output.set_logical_extent(extent);
     Ok(value_output)
 }
 

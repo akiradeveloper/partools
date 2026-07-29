@@ -2,10 +2,9 @@
 
 use cubecl::prelude::{CubeType, Runtime};
 
-use crate::{
-    Error, Executor, MAlloc, MIndex, MIter, MIterMut, MRadix, MStorage, MVec,
-    api::iter::MStorageExtent, op::BinaryPredicateOp, op::ReductionOp,
-};
+use crate::api::iter::MStorageExtent;
+use crate::op::{BinaryPredicateOp, ReductionOp};
+use crate::{Error, Executor, MAlloc, MIndex, MIter, MIterMut, MRadix, MStorage, MVec};
 
 struct ByKeyScanOperation<'a, R: Runtime, Keys, Values, Equal, Item: MAlloc<R>, Op> {
     exec: &'a Executor<R>,
@@ -30,11 +29,16 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        let keys = crate::api::iter::lower_fixed::<R, _>(self.keys);
-        let values = crate::api::iter::lower_fixed::<R, _>(self.values);
+        let extent = self
+            .keys
+            .logical_extent()?
+            .zipped(&self.values.logical_extent()?)?;
+        let keys =
+            crate::api::iter::lower_fixed::<R, _>(self.keys).with_logical_extent(extent.clone());
+        let values = crate::api::iter::lower_fixed::<R, _>(self.values).with_logical_extent(extent);
         if let Some(init) = self.init {
             crate::core::by_key::exclusive_scan_by_key_lowered(
                 self.exec,
@@ -97,7 +101,7 @@ impl<R, KeyItem, ValueItem, Keys, Values, Equal, Op, ValueOutput>
 where
     R: Runtime,
     KeyItem: CubeType + Send + Sync + 'static,
-    ValueItem: MAlloc<R> + crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+    ValueItem: MAlloc<R> + crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
     Keys: MIter<R, Item = KeyItem>,
     Values: MIter<R, Item = ValueItem>,
     Equal: BinaryPredicateOp<KeyItem>,
@@ -108,13 +112,17 @@ where
 
     fn run<KeyOutput>(self, key_output: KeyOutput) -> Self::Result
     where
-        KeyItem: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        KeyItem: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         KeyOutput: crate::api::iter::ConcreteOutput<R, KeyItem>,
     {
+        let extent = self
+            .keys
+            .logical_extent()?
+            .zipped(&self.values.logical_extent()?)?;
         crate::core::by_key::reduce_by_key_lowered(
             self.exec,
-            crate::api::iter::lower_fixed::<R, _>(self.keys),
-            crate::api::iter::lower_fixed::<R, _>(self.values),
+            crate::api::iter::lower_fixed::<R, _>(self.keys).with_logical_extent(extent.clone()),
+            crate::api::iter::lower_fixed::<R, _>(self.values).with_logical_extent(extent),
             self.equal,
             crate::api::value::into_scratch::<R, ValueItem>(self.init),
             self.op,
@@ -141,7 +149,7 @@ where
 
     fn run<ValueOutput>(self, value_output: ValueOutput) -> Self::Result
     where
-        ValueItem: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        ValueItem: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         ValueOutput: crate::api::iter::ConcreteOutput<R, ValueItem>,
     {
         self.key_output
@@ -177,13 +185,17 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
+        let extent = self
+            .keys
+            .logical_extent()?
+            .zipped(&self.values.logical_extent()?)?;
         crate::core::by_key::unique_by_key(
             self.exec,
-            crate::api::iter::lower_fixed::<R, _>(self.keys),
-            crate::api::iter::lower_fixed::<R, _>(self.values),
+            crate::api::iter::lower_fixed::<R, _>(self.keys).with_logical_extent(extent.clone()),
+            crate::api::iter::lower_fixed::<R, _>(self.values).with_logical_extent(extent),
             self.equal,
             output,
         )
@@ -244,8 +256,10 @@ where
             right: value_len as usize,
         });
     }
-    let value_output = exec.alloc::<Values::Item>(len);
+    let extent = keys.logical_extent()?.zipped(&values.logical_extent()?)?;
+    let mut value_output = exec.alloc::<Values::Item>(len);
     sort_values_by_key_into(exec, keys, values, less, value_output.slice_mut(..))?;
+    value_output.set_logical_extent(extent);
     Ok(value_output)
 }
 
@@ -289,8 +303,10 @@ where
             right: value_len as usize,
         });
     }
-    let value_output = exec.alloc::<Values::Item>(len);
+    let extent = keys.logical_extent()?.zipped(&values.logical_extent()?)?;
+    let mut value_output = exec.alloc::<Values::Item>(len);
     radix_sort_values_by_key_into(exec, keys, values, value_output.slice_mut(..))?;
+    value_output.set_logical_extent(extent);
     Ok(value_output)
 }
 
@@ -317,11 +333,17 @@ where
             right: value_len as usize,
         });
     }
-    let key_storage =
-        crate::api::algorithm::transform::map_preserving_extent(exec, keys, crate::op::Identity)?;
+    let extent = keys.logical_extent()?.zipped(&values.logical_extent()?)?;
+    let mut key_storage = crate::api::algorithm::transform::map(exec, keys, crate::op::Identity)?;
+    key_storage.set_logical_extent(extent);
     let permutation =
         <Keys::Item as MRadix<R>>::radix_permutation(exec, &key_storage, key_len as usize)?;
-    crate::api::algorithm::indexed::gather_into(exec, values, permutation.column(), value_output)
+    crate::api::algorithm::indexed::apply_permutation_into(
+        exec,
+        crate::api::iter::lower_fixed::<R, _>(values),
+        permutation.column(),
+        value_output,
+    )
 }
 
 /// Stably sorts values using a key-derived permutation without materializing keys.
@@ -348,12 +370,18 @@ where
             right: value_len as usize,
         });
     }
-    let permutation = crate::ordering::sort_control_with(
+    let extent = keys.logical_extent()?.zipped(&values.logical_extent()?)?;
+    let permutation = crate::core::ordering::sort_control_with(
         exec,
-        crate::api::iter::lower_fixed::<R, _>(keys),
+        crate::api::iter::lower_fixed::<R, _>(keys).with_logical_extent(extent),
         less,
     )?;
-    crate::api::algorithm::indexed::gather_into(exec, values, permutation.column(), value_output)
+    crate::api::algorithm::indexed::apply_permutation_into(
+        exec,
+        crate::api::iter::lower_fixed::<R, _>(values),
+        permutation.column(),
+        value_output,
+    )
 }
 
 /// Computes an inclusive scan within each adjacent equal-key segment.
@@ -419,8 +447,10 @@ where
             right: value_len as usize,
         });
     }
-    let output = exec.alloc::<Values::Item>(len);
+    let extent = keys.logical_extent()?.zipped(&values.logical_extent()?)?;
+    let mut output = exec.alloc::<Values::Item>(len);
     inclusive_scan_by_key_into(exec, keys, values, equal, op, output.slice_mut(..))?;
+    output.set_logical_extent(extent);
     Ok(output)
 }
 
@@ -538,8 +568,10 @@ where
             right: value_len as usize,
         });
     }
-    let output = exec.alloc::<Values::Item>(len);
+    let extent = keys.logical_extent()?.zipped(&values.logical_extent()?)?;
+    let mut output = exec.alloc::<Values::Item>(len);
     exclusive_scan_by_key_into(exec, keys, values, equal, init, op, output.slice_mut(..))?;
+    output.set_logical_extent(extent);
     Ok(output)
 }
 
@@ -673,7 +705,7 @@ where
         key_output.slice_mut(..),
         value_output.slice_mut(..),
     )?;
-    let extent = crate::extent::LogicalExtent::from_device(&len, capacity as usize);
+    let extent = crate::core::extent::LogicalExtent::from_device(&len, capacity as usize);
     key_output.set_logical_extent(extent.clone());
     value_output.set_logical_extent(extent);
     Ok((key_output, value_output))
@@ -779,7 +811,7 @@ where
     }
     let mut value_output = exec.alloc::<Values::Item>(capacity);
     let len = unique_by_key_into(exec, keys, values, equal, value_output.slice_mut(..))?;
-    value_output.set_logical_extent(crate::extent::LogicalExtent::from_device(
+    value_output.set_logical_extent(crate::core::extent::LogicalExtent::from_device(
         &len,
         capacity as usize,
     ));

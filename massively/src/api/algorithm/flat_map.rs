@@ -1,10 +1,9 @@
 use cubecl::prelude::{CubeType, Runtime};
 use std::marker::PhantomData;
 
-use crate::{
-    DeviceVec, Error, Executor, MAlloc, MIter, MIterMut, MStorage, MVec,
-    op::{ExpandOp, UnaryOp},
-};
+use crate::core::read::SliceExpression;
+use crate::op::{ExpandOp, UnaryOp};
+use crate::{DeviceVec, Error, Executor, MAlloc, MIter, MIterMut, MStorage, MVec};
 
 struct Count<Op>(PhantomData<Op>);
 
@@ -40,10 +39,10 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Op::Output: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Op::Output: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Op::Output>,
     {
-        crate::expansion::generate::<R, _, _, Op>(
+        crate::core::expansion::generate::<R, _, _, Op>(
             self.exec,
             &crate::api::iter::lower_fixed::<R, _>(self.input),
             self.element_offsets,
@@ -65,21 +64,28 @@ where
     Op::Output: MAlloc<R>,
 {
     let _ = op;
-    let input_len = input.capacity()?;
+    // Expansion constructs validated segment offsets, so this is an explicit
+    // host-size boundary. The output count is resolved below as well.
+    let input_len = crate::api::iter::checked_len(input.logical_extent()?.read(exec)?)?;
+    let input = input.lower_read().slice_expression(0, input_len as usize);
     let offset_count = input_len.checked_add(1).ok_or(Error::LengthTooLarge {
         len: input_len as usize + 1,
     })?;
 
     let counts: DeviceVec<R, u32> =
         crate::vector::map(exec, input.clone(), Count::<Op>(PhantomData))?;
-    let positions = crate::scan::inclusive_scan_u32(exec, &counts)?;
-    let output_len_storage = crate::scan::last_u32(exec, &positions)?;
+    let positions = crate::core::scan::inclusive_scan_u32(exec, &counts)?;
+    let output_len_storage = crate::core::scan::last_u32(exec, &positions)?;
     let output_len = crate::api::value::read::<R, u32>(exec, &output_len_storage)?;
 
     let element_offsets = exec.alloc::<u32>(offset_count);
     crate::vector::fill(exec, 0u32, element_offsets.slice_mut(..1))?;
     if input_len != 0 {
-        crate::vector::copy(exec, positions.slice(..), element_offsets.slice_mut(1..))?;
+        crate::vector::copy(
+            exec,
+            positions.slice(..input_len),
+            element_offsets.slice_mut(1..),
+        )?;
     }
 
     let control = crate::seg::control::SegmentControl::from_materialized(

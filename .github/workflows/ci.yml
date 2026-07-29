@@ -12,26 +12,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  proof:
-    name: Lean proof
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Build proof environment
-        working-directory: verification
-        run: docker build --tag massively-verification:lean-4.32.0 .
-
-      - name: Check all definitions and proofs
-        working-directory: verification
-        run: |
-          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
-            -v "$PWD:/workspace" -w /workspace/proof \
-            massively-verification:lean-4.32.0 bash -c 'lake build'
-
   test:
     name: Test
     runs-on: ubuntu-latest

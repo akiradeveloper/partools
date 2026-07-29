@@ -3,44 +3,15 @@
 use core::marker::PhantomData;
 use cubecl::prelude::*;
 
-use crate::{
-    ColumnMut, DeviceVec, Dispatch, Error, Executor, MFlag, MIndex, MVec, ReadExpression,
-    Transform,
-    op::{IndexedBinaryOp, IndexedUnaryOp, UnaryOp},
-    output::StageOutput,
-    read::{AdjacentIndexedTransform, Env0, Env1, IndexedTransform, LowerReadExpression},
-    reduce::{ReduceDispatch, ReductionOp, StageRead, reduce},
-    scan::{InclusiveScanDispatch, inclusive_scan},
+use crate::core::arity::Dispatch;
+use crate::core::op::{PredicateOp, ReductionOp};
+use crate::core::read::{
+    AdjacentIndexedTransform, Env0, IndexedTransform, LowerReadExpression, ReadExpression,
+    StageRead, Transform,
 };
-
-/// Compile-time flag predicate applied to one semantic input item.
-///
-/// # Examples
-///
-/// ```
-/// use cubecl::prelude::*;
-/// use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-/// use massively::{Executor, op, vector::count_if};
-///
-/// struct Positive;
-///
-/// #[cubecl::cube]
-/// impl op::PredicateOp<i32> for Positive {
-///     fn apply(value: i32) -> massively::MFlag {
-///         massively::flag::from_bool(value > 0)
-///     }
-/// }
-///
-/// let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
-/// let input = exec.to_device(&[-1_i32, 2, 3]);
-///
-/// let count = count_if(&exec, input.slice(..), Positive).unwrap();
-/// assert_eq!(count, 2);
-/// ```
-#[cubecl::cube]
-pub trait PredicateOp<Input: CubeType>: 'static + Send + Sync {
-    fn apply(input: Input) -> MFlag;
-}
+use crate::core::reduce::{ReduceDispatch, reduce};
+use crate::op::{IndexedBinaryOp, IndexedUnaryOp, UnaryOp};
+use crate::{DeviceVec, Error, Executor, MFlag, MIndex, MVec};
 
 #[cubecl::cube]
 pub(crate) fn predicate<Input, Pred>(input: Input) -> bool
@@ -96,7 +67,7 @@ where
     type Output = u32;
 
     fn apply(input: Input, index: u32) -> u32 {
-        if crate::predicate::predicate::<Input, Pred>(input) {
+        if crate::core::predicate::predicate::<Input, Pred>(input) {
             index
         } else {
             4_294_967_295u32
@@ -116,8 +87,8 @@ where
 
     fn apply(previous: Input, current: Input, index: u32) -> u32 {
         if index != 0u32
-            && !crate::predicate::predicate::<Input, Pred>(previous)
-            && crate::predicate::predicate::<Input, Pred>(current)
+            && !crate::core::predicate::predicate::<Input, Pred>(previous)
+            && crate::core::predicate::predicate::<Input, Pred>(current)
         {
             index
         } else {
@@ -132,7 +103,10 @@ pub trait PredicateInput<R: Runtime, Pred>: ReadExpression + Sized {
     fn predicate_count(self, exec: &Executor<R>) -> Result<DeviceVec<R, u32>, Error>;
     fn predicate_first(self, exec: &Executor<R>) -> Result<DeviceVec<R, u32>, Error>;
     fn predicate_is_partitioned(self, exec: &Executor<R>) -> Result<DeviceVec<R, u32>, Error>;
-    fn predicate_positions(self, exec: &Executor<R>) -> Result<DeviceVec<R, u32>, Error>;
+    fn predicate_control(
+        self,
+        exec: &Executor<R>,
+    ) -> Result<crate::core::selection::SelectionControl<R>, Error>;
 }
 
 impl<R, Input, Pred> PredicateInput<R, Pred> for Input
@@ -144,53 +118,41 @@ where
         ReadExpression<Item = MFlag> + LowerReadExpression + StageRead<R, Env0>,
     IndexedTransform<Input, FirstMatchingIndex<Pred>>:
         ReadExpression<Item = u32> + LowerReadExpression + StageRead<R, Env0>,
-    Dispatch<crate::A13, crate::S12>:
+    Dispatch<crate::core::arity::A13, crate::core::storage::S12>:
         ReduceDispatch<
                 R,
                 IndexedTransform<Input, FirstMatchingIndex<Pred>>,
                 u32,
                 MinU32,
-                crate::read::KernelReadSlots<
+                crate::core::read::KernelReadSlots<
                     <IndexedTransform<Input, FirstMatchingIndex<Pred>> as LowerReadExpression>::Slots,
                 >,
                 Storage = DeviceVec<R, u32>,
             >,
     AdjacentIndexedTransform<Input, FirstPartitionViolation<Pred>>:
         ReadExpression<Item = u32> + LowerReadExpression + StageRead<R, Env0>,
-    Dispatch<crate::A13, crate::S12>: ReduceDispatch<
+    Dispatch<crate::core::arity::A13, crate::core::storage::S12>: ReduceDispatch<
             R,
             AdjacentIndexedTransform<Input, FirstPartitionViolation<Pred>>,
             u32,
             MinU32,
-            crate::read::KernelReadSlots<
+            crate::core::read::KernelReadSlots<
                 <AdjacentIndexedTransform<Input, FirstPartitionViolation<Pred>> as LowerReadExpression>::Slots,
             >,
             Storage = DeviceVec<R, u32>,
         >,
-    Dispatch<crate::A13, crate::S12>:
+    Dispatch<crate::core::arity::A13, crate::core::storage::S12>:
         ReduceDispatch<
                 R,
                 Transform<Input, PredicateMap<Pred>>,
                 u32,
                 SumU32,
-                crate::read::KernelReadSlots<
+                crate::core::read::KernelReadSlots<
                     <Transform<Input, PredicateMap<Pred>> as LowerReadExpression>::Slots,
                 >,
                 Storage = DeviceVec<R, u32>,
             >,
-    Dispatch<crate::A13, crate::S12>:
-        InclusiveScanDispatch<
-            R,
-            Transform<Input, PredicateMap<Pred>>,
-            ColumnMut<u32>,
-            u32,
-            crate::read::KernelReadSlots<
-                <Transform<Input, PredicateMap<Pred>> as LowerReadExpression>::Slots,
-            >,
-            crate::output::KernelOutputSlots<Env1<u32>>,
-            SumU32,
-        >,
-    ColumnMut<u32>: StageOutput<R, Env0>,
+    Transform<Input, PredicateMap<Pred>>: crate::core::selection::FlagInput<R>,
 {
     fn predicate_count(self, exec: &Executor<R>) -> Result<DeviceVec<R, u32>, Error> {
         reduce(
@@ -222,18 +184,14 @@ where
         )
     }
 
-    fn predicate_positions(self, exec: &Executor<R>) -> Result<DeviceVec<R, u32>, Error> {
-        let len = self.logical_len()?;
-        let extent = self.logical_extent()?;
-        let mut positions = exec.alloc_row::<u32>(len);
-        positions.set_logical_extent(extent);
-        inclusive_scan(
-            exec,
+    fn predicate_control(
+        self,
+        exec: &Executor<R>,
+    ) -> Result<crate::core::selection::SelectionControl<R>, Error> {
+        crate::core::selection::FlagInput::selected_control(
             Transform::new(self, PredicateMap::<Pred>(PhantomData)),
-            SumU32,
-            positions.slice_mut_usize(..),
-        )?;
-        Ok(positions)
+            exec,
+        )
     }
 
 }
@@ -280,7 +238,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Counting, Permute, Zip};
+    use crate::core::iter::Zip;
+    use crate::core::read::{Counting, Permute};
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
     fn read(exec: &Executor<WgpuRuntime>, value: MVec<WgpuRuntime, u32>) -> u32 {
@@ -383,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_materialization_uses_eval8() {
+    fn predicate_materialization_uses_padded_fixed_evaluator() {
         let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
         let columns: Vec<_> = (0_u32..7)
             .map(|_| exec.to_device(&[1_u32, 2, 3, 4]))

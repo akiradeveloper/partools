@@ -132,13 +132,7 @@ fn bench_performance(c: &mut Criterion) {
             group,
             exec,
             "exclusive_scan",
-            exclusive_scan(
-                &exec,
-                black_box(values.slice(..)),
-                reduce_init.clone(),
-                SumF32,
-            )
-            .unwrap()
+            exclusive_scan(&exec, black_box(values.slice(..)), reduce_init, SumF32,).unwrap()
         );
         benchmark!(
             group,
@@ -149,7 +143,7 @@ fn bench_performance(c: &mut Criterion) {
                 black_box(keys.slice(..)),
                 black_box(values.slice(..)),
                 EqualU32,
-                reduce_init.clone(),
+                reduce_init,
                 SumF32,
             )
             .unwrap()
@@ -176,23 +170,18 @@ fn bench_performance(c: &mut Criterion) {
         benchmark_synchronous!(
             group,
             "reduce",
-            reduce(
-                &exec,
-                black_box(values.slice(..)),
-                reduce_init.clone(),
-                SumF32,
-            )
-            .unwrap()
+            reduce(&exec, black_box(values.slice(..)), reduce_init, SumF32,).unwrap()
         );
-        benchmark_synchronous!(
+        benchmark!(
             group,
+            exec,
             "reduce_by_key",
             reduce_by_key(
                 &exec,
                 black_box(keys.slice(..)),
                 black_box(values.slice(..)),
                 EqualU32,
-                reduce_init.clone(),
+                reduce_init,
                 SumF32,
             )
             .unwrap()
@@ -203,13 +192,14 @@ fn bench_performance(c: &mut Criterion) {
         let values = exec.to_device(&common::dense_f32(N));
         let flags = exec.to_device(&common::flags(N, 50));
         exec.sync().unwrap();
-        benchmark_synchronous!(
+        benchmark!(
             group,
+            exec,
             "copy_where",
             copy_where(
                 &exec,
                 black_box(values.slice(..)),
-                common::as_stencil(black_box(flags.slice(..))),
+                black_box(flags.slice(..)),
             )
             .unwrap()
         );
@@ -219,13 +209,14 @@ fn bench_performance(c: &mut Criterion) {
             black_box(boundary);
             output
         });
-        benchmark_synchronous!(
+        benchmark!(
             group,
+            exec,
             "remove_where",
             remove_where(
                 &exec,
                 black_box(values.slice(..)),
-                common::as_stencil(black_box(flags.slice(..))),
+                black_box(flags.slice(..)),
             )
             .unwrap()
         );
@@ -250,7 +241,7 @@ fn bench_performance(c: &mut Criterion) {
             gather(
                 &exec,
                 black_box(values.slice(..)),
-                common::as_indices(black_box(reverse_indices.slice(..))),
+                black_box(reverse_indices.slice(..)),
             )
             .unwrap()
         );
@@ -261,8 +252,8 @@ fn bench_performance(c: &mut Criterion) {
             gather_where(
                 &exec,
                 black_box(values.slice(..)),
-                common::as_indices(black_box(reverse_indices.slice(..))),
-                common::as_stencil(black_box(flags.slice(..))),
+                black_box(reverse_indices.slice(..)),
+                black_box(flags.slice(..)),
                 output.slice_mut(..),
             )
             .unwrap()
@@ -274,7 +265,7 @@ fn bench_performance(c: &mut Criterion) {
             scatter(
                 &exec,
                 black_box(values.slice(..)),
-                common::as_indices(black_box(reverse_indices.slice(..))),
+                black_box(reverse_indices.slice(..)),
                 output.slice_mut(..),
             )
             .unwrap()
@@ -286,8 +277,8 @@ fn bench_performance(c: &mut Criterion) {
             scatter_reduce(
                 &exec,
                 black_box(values.slice(..)),
-                common::as_indices(black_box(collision_indices.slice(..))),
-                reduce_init.clone(),
+                black_box(collision_indices.slice(..)),
+                reduce_init,
                 SumF32,
                 output.slice_mut(..),
             )
@@ -300,8 +291,8 @@ fn bench_performance(c: &mut Criterion) {
             scatter_where(
                 &exec,
                 black_box(values.slice(..)),
-                common::as_indices(black_box(reverse_indices.slice(..))),
-                common::as_stencil(black_box(flags.slice(..))),
+                black_box(reverse_indices.slice(..)),
+                black_box(flags.slice(..)),
                 output.slice_mut(..),
             )
             .unwrap()
@@ -341,13 +332,15 @@ fn bench_performance(c: &mut Criterion) {
         let keys = exec.to_device(&common::run_keys(N, 8));
         let values = exec.to_device(&ascending(N));
         exec.sync().unwrap();
-        benchmark_synchronous!(
+        benchmark!(
             group,
+            exec,
             "unique",
             unique(&exec, black_box(keys.slice(..)), EqualU32).unwrap()
         );
-        benchmark_synchronous!(
+        benchmark!(
             group,
+            exec,
             "unique_by_key",
             unique_by_key(
                 &exec,
@@ -412,8 +405,9 @@ fn bench_performance(c: &mut Criterion) {
         let left = exec.to_device(&ascending(N));
         let right = exec.to_device(&shifted(N));
         exec.sync().unwrap();
-        benchmark_synchronous!(
+        benchmark!(
             group,
+            exec,
             "set_difference",
             set_difference(
                 &exec,
@@ -423,8 +417,9 @@ fn bench_performance(c: &mut Criterion) {
             )
             .unwrap()
         );
-        benchmark_synchronous!(
+        benchmark!(
             group,
+            exec,
             "set_intersection",
             set_intersection(
                 &exec,
@@ -434,8 +429,9 @@ fn bench_performance(c: &mut Criterion) {
             )
             .unwrap()
         );
-        benchmark_synchronous!(
+        benchmark!(
             group,
+            exec,
             "set_union",
             set_union(
                 &exec,

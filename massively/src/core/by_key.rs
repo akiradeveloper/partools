@@ -2,12 +2,12 @@
 
 use cubecl::prelude::*;
 
-use crate::{
-    DeviceVec, Error, Executor, ReadExpression,
-    allocation::ScratchStorage,
-    ordering::{AdjacentFlagInput, BinaryPredicateOp, UniqueHead, unique_head_flags},
-    selection::{CopySelected, SelectionControl},
-};
+use crate::core::allocation::ScratchStorage;
+use crate::core::op::BinaryPredicateOp;
+use crate::core::ordering::{AdjacentFlagInput, UniqueHead, unique_head_flags};
+use crate::core::read::ReadExpression;
+use crate::core::selection::{CopySelected, SelectionControl};
+use crate::{DeviceVec, Error, Executor};
 
 /// Key-only phase producing segment head flags.
 #[doc(hidden)]
@@ -41,11 +41,11 @@ where
     Values: crate::core::facade::KernelInput<R>,
     Values::Item: ScratchStorage<R>,
     Op: crate::op::ReductionOp<Values::Item>,
-    Output:
-        crate::core::facade::KernelOutput<R> + crate::output::OutputExpression<Item = Values::Item>,
+    Output: crate::core::facade::KernelOutput<R>
+        + crate::core::output::OutputExpression<Item = Values::Item>,
 {
     let heads = keys.segment_heads(exec)?;
-    crate::segmented::segmented_inclusive::<R, _, _, Values::Item, Op>(
+    crate::core::segmented::segmented_inclusive::<R, _, _, Values::Item, Op>(
         exec, &values, &heads, &output,
     )
 }
@@ -66,11 +66,11 @@ where
     Values: crate::core::facade::KernelInput<R>,
     Values::Item: ScratchStorage<R>,
     Op: crate::op::ReductionOp<Values::Item>,
-    Output:
-        crate::core::facade::KernelOutput<R> + crate::output::OutputExpression<Item = Values::Item>,
+    Output: crate::core::facade::KernelOutput<R>
+        + crate::core::output::OutputExpression<Item = Values::Item>,
 {
     let heads = keys.segment_heads(exec)?;
-    crate::segmented::segmented_exclusive::<R, _, _, Values::Item, Op>(
+    crate::core::segmented::segmented_exclusive::<R, _, _, Values::Item, Op>(
         exec, &values, &heads, init, &output,
     )
 }
@@ -88,35 +88,30 @@ pub(crate) fn reduce_by_key_lowered<R, Keys, Values, Equal, Op, KeyOutput, Value
 ) -> Result<DeviceVec<R, u32>, Error>
 where
     R: Runtime,
-    Keys: crate::core::facade::KernelInput<R, Item = KeyOutput::Item> + SegmentKeyInput<R, Equal>,
+    Keys: crate::core::facade::KernelInput<R, Item = KeyOutput::Item>
+        + SegmentKeyInput<R, Equal>
+        + CopySelected<R, KeyOutput>,
     Values: crate::core::facade::KernelInput<R>,
     Values::Item: ScratchStorage<R>,
     Op: crate::op::ReductionOp<Values::Item>,
     KeyOutput: crate::core::facade::KernelOutput<R>,
-    ValueOutput:
-        crate::core::facade::KernelOutput<R> + crate::output::OutputExpression<Item = Values::Item>,
+    ValueOutput: crate::core::facade::KernelOutput<R>
+        + crate::core::output::OutputExpression<Item = Values::Item>,
 {
     let heads = keys.clone().segment_heads(exec)?;
     let head_control = SelectionControl::from_flags(exec, heads.clone())?;
-    crate::segmented::segmented_reduce::<R, _, _, Values::Item, Op>(
+    let head_positions = head_control.materialize_positions(exec)?;
+    crate::core::segmented::segmented_reduce::<R, _, _, Values::Item, Op>(
         exec,
         &values,
         &heads,
-        head_control.indices(),
+        &head_positions,
         head_control.count(),
         init,
         op,
         &value_output,
     )?;
-    crate::indexed::IndexedCopyInput::indexed_copy_selected(
-        keys,
-        exec,
-        head_control.indices().column(),
-        None,
-        Some(head_control.count()),
-        true,
-        key_output,
-    )?;
+    keys.copy_selected(exec, &head_control, key_output)?;
     Ok(head_control.count().clone())
 }
 
@@ -135,14 +130,15 @@ where
     Values: crate::core::facade::KernelInput<R>,
     Values::Item: ScratchStorage<R>,
     Op: crate::op::ReductionOp<Values::Item>,
-    Output:
-        crate::core::facade::KernelOutput<R> + crate::output::OutputExpression<Item = Values::Item>,
+    Output: crate::core::facade::KernelOutput<R>
+        + crate::core::output::OutputExpression<Item = Values::Item>,
 {
-    crate::segmented::segmented_reduce::<R, _, _, Values::Item, Op>(
+    let head_positions = head_control.materialize_positions(exec)?;
+    crate::core::segmented::segmented_reduce::<R, _, _, Values::Item, Op>(
         exec,
         &values,
         heads,
-        head_control.indices(),
+        &head_positions,
         head_control.count(),
         init,
         op,
@@ -157,7 +153,7 @@ where
 #[doc(hidden)]
 pub trait UniqueByKeyKeys<R: Runtime, Equal>: ReadExpression + Sized {
     fn unique_key_len(&self) -> Result<usize, Error>;
-    fn unique_key_extent(&self) -> Result<crate::extent::LogicalExtent, Error>;
+    fn unique_key_extent(&self) -> Result<crate::core::extent::LogicalExtent, Error>;
     fn unique_key_control(self, exec: &Executor<R>) -> Result<SelectionControl<R>, Error>;
 }
 
@@ -166,15 +162,15 @@ where
     R: Runtime,
     Keys: ReadExpression
         + AdjacentFlagInput<R, UniqueHead<Equal>>
-        + crate::reduce::StageRead<R, crate::read::Env0>,
+        + crate::core::read::StageRead<R, crate::core::read::Env0>,
     Equal: BinaryPredicateOp<Keys::Item>,
 {
     fn unique_key_len(&self) -> Result<usize, Error> {
-        crate::reduce::StageRead::logical_len(self)
+        crate::core::read::StageRead::physical_len(self)
     }
 
-    fn unique_key_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        crate::reduce::StageRead::logical_extent(self)
+    fn unique_key_extent(&self) -> Result<crate::core::extent::LogicalExtent, Error> {
+        crate::core::read::StageRead::logical_extent(self)
     }
 
     fn unique_key_control(self, exec: &Executor<R>) -> Result<SelectionControl<R>, Error> {
@@ -215,7 +211,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Counting, Permute, RowStorage, Zip};
+    use crate::core::allocation::RowStorage;
+    use crate::core::iter::Zip;
+    use crate::core::read::{Counting, Permute};
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
     type Three = (u32, u32, u32);
@@ -339,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn segmented_by_key_algorithms_separate_eval8_keys_from_storage7_values() {
+    fn segmented_by_key_algorithms_separate_eight_slot_keys_from_storage7_values() {
         let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
         let len = 600usize;
         let keys_host: Vec<u32> = (0..len)

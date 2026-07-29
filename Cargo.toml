@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "massively",
-    "verification/oracle",
+    "oracle",
 ]
 resolver = "3"
 
@@ -12,14 +12,14 @@ license = "MIT"
 repository = "https://github.com/akiradeveloper/massively"
 
 [workspace.dependencies]
-cubecl = { version = "0.11.0-pre.1", default-features = false, features = [
+cubecl = { version = "0.11.0-pre.3", default-features = false, features = [
     "std",
     "stdlib",
 ] }
 
-# The arity-indexed CubeCL kernels deliberately cover the full read/storage
-# product. Debug metadata and concurrent rustc processes multiply the peak
-# memory of that generated code without affecting runtime diagnostics.
+# CubeCL kernels use a fixed read/write ABI to avoid a read/storage arity
+# product. Debug metadata still increases the memory used by generated code
+# without affecting runtime diagnostics.
 [profile.dev]
 debug = 0
 incremental = false

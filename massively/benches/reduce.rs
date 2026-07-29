@@ -28,20 +28,14 @@ fn bench_reduce(c: &mut Criterion) {
         let init = 0.0_f32;
         exec.sync().unwrap();
         group.bench_function(BenchmarkId::new("reduce", len), |b| {
-            b.iter(|| black_box(reduce(&exec, values.slice(..), init.clone(), Sum).unwrap()))
+            b.iter(|| black_box(reduce(&exec, values.slice(..), init, Sum).unwrap()))
         });
         group.bench_function(BenchmarkId::new("reduce_by_key", len), |b| {
             b.iter(|| {
-                black_box(
-                    reduce_by_key(
-                        &exec,
-                        keys.slice(..),
-                        values.slice(..),
-                        Equal,
-                        init.clone(),
-                        Sum,
-                    )
-                    .unwrap(),
+                common::completed(
+                    &exec,
+                    reduce_by_key(&exec, keys.slice(..), values.slice(..), Equal, init, Sum)
+                        .unwrap(),
                 )
             })
         });

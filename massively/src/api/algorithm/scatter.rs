@@ -1,9 +1,8 @@
 use cubecl::prelude::*;
 
-use crate::{
-    Error, Executor, MAlloc, MFlag, MIter, MIterMut, MVec, RowStorage,
-    op::{BinaryPredicateOp, ReductionOp},
-};
+use crate::core::allocation::RowStorage;
+use crate::op::{BinaryPredicateOp, ReductionOp};
+use crate::{Error, Executor, MAlloc, MFlag, MIter, MIterMut, MVec};
 
 struct IndexLess;
 
@@ -48,10 +47,10 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        crate::indexed::IndexedCopyInput::indexed_copy_selected(
+        crate::core::indexed::IndexedCopyInput::indexed_copy_selected(
             crate::api::iter::lower::<R, _>(self.values),
             self.exec,
             crate::api::iter::lower::<R, _>(self.indices),
@@ -75,7 +74,7 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
         crate::core::scatter::scatter(
@@ -107,7 +106,7 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
         crate::core::scatter::scatter_where(
@@ -141,7 +140,7 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
         let len = self.values.capacity()?;
@@ -161,37 +160,45 @@ where
             .zipped(&self.indices.logical_extent()?)?;
 
         let indices = crate::api::iter::lower::<R, _>(self.indices);
-        let mut sorted_values =
-            <Item as crate::allocation::ScratchStorage<R>>::alloc_scratch(self.exec, len as usize);
+        let mut sorted_values = <Item as crate::core::allocation::ScratchStorage<R>>::alloc_scratch(
+            self.exec,
+            len as usize,
+        );
         RowStorage::set_logical_extent(&mut sorted_values, extent);
         let values = crate::api::iter::lower_fixed::<R, _>(self.values);
         let permutation =
-            crate::ordering::sort_control_with(self.exec, indices.clone(), IndexLess)?;
-        crate::indexed::gather_direct(
-            self.exec,
+            crate::core::ordering::sort_control_with(self.exec, indices.clone(), IndexLess)?;
+        crate::core::indexed::PermutationCopyInput::permutation_copy(
             values,
+            self.exec,
             permutation.column(),
-            <<Item as crate::allocation::ScratchStorage<R>>::Storage as RowStorage<R>>::write(
+            None,
+            <<Item as crate::core::allocation::ScratchStorage<R>>::Storage as RowStorage<R>>::write(
                 &sorted_values,
             ),
         )?;
 
-        let heads = crate::ordering::unique_head_flags_ordered::<R, _, IndexEqual>(
+        let heads = crate::core::ordering::unique_head_flags_ordered::<R, _, IndexEqual>(
             self.exec,
             indices.clone(),
             &permutation,
         )?;
         let head_control =
-            crate::selection::SelectionControl::from_flags(self.exec, heads.clone())?;
-        let reduced_extent = head_control.indices().logical_extent();
+            crate::core::selection::SelectionControl::from_flags(self.exec, heads.clone())?;
+        let head_indices = head_control.materialize_indices(self.exec)?;
+        let reduced_extent = head_indices.logical_extent();
 
-        let sorted_values = crate::read::FixedRead::new(
-            <<Item as crate::allocation::ScratchStorage<R>>::Storage as RowStorage<R>>::read(
-                &sorted_values,
-            ),
-        );
+        let sorted_values =
+            crate::core::read::FixedRead::new(<<Item as crate::core::allocation::ScratchStorage<
+                R,
+            >>::Storage as RowStorage<R>>::read(
+                &sorted_values
+            ));
         let mut reduced_values =
-            <Item as crate::allocation::ScratchStorage<R>>::alloc_scratch(self.exec, len as usize);
+            <Item as crate::core::allocation::ScratchStorage<R>>::alloc_scratch(
+                self.exec,
+                len as usize,
+            );
         crate::core::by_key::reduce_values_by_heads_lowered(
             self.exec,
             sorted_values,
@@ -199,22 +206,23 @@ where
             &head_control,
             crate::api::value::into_scratch::<R, Item>(self.init),
             self.op,
-            <<Item as crate::allocation::ScratchStorage<R>>::Storage as RowStorage<R>>::write(
+            <<Item as crate::core::allocation::ScratchStorage<R>>::Storage as RowStorage<R>>::write(
                 &reduced_values,
             ),
         )?;
         RowStorage::set_logical_extent(&mut reduced_values, reduced_extent);
 
-        let reduced_values = crate::read::FixedRead::new(
-            <<Item as crate::allocation::ScratchStorage<R>>::Storage as RowStorage<R>>::read(
-                &reduced_values,
-            ),
-        );
+        let reduced_values =
+            crate::core::read::FixedRead::new(<<Item as crate::core::allocation::ScratchStorage<
+                R,
+            >>::Storage as RowStorage<R>>::read(
+                &reduced_values
+            ));
         crate::core::scatter_reduce::apply::<R, _, _, _, Op>(
             self.exec,
             reduced_values,
             indices,
-            head_control.indices(),
+            &head_indices,
             &permutation,
             head_control.count(),
             output,

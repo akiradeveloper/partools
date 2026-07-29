@@ -17,8 +17,8 @@ fn bench_where_indexed(c: &mut Criterion) {
                 gather_where(
                     &exec,
                     input.slice(..),
-                    common::as_indices(indices.slice(..)),
-                    common::as_stencil(flags.slice(..)),
+                    indices.slice(..),
+                    flags.slice(..),
                     output.slice_mut(..),
                 )
                 .unwrap();
@@ -30,8 +30,8 @@ fn bench_where_indexed(c: &mut Criterion) {
                 scatter_where(
                     &exec,
                     input.slice(..),
-                    common::as_indices(indices.slice(..)),
-                    common::as_stencil(flags.slice(..)),
+                    indices.slice(..),
+                    flags.slice(..),
                     output.slice_mut(..),
                 )
                 .unwrap();

@@ -6,24 +6,28 @@ use std::ops::RangeBounds;
 
 use cubecl::prelude::Runtime;
 
-use crate::{
-    Column, ColumnMut, DeviceVec, Error, Executor, MStorageElement, ReadExpression, S1,
-    StorageLayout, Zip,
-    api::iter::{MAlloc, MIter, MIterMut, MStorage, MStorageExtent, StorageSlice, StorageSliceMut},
-    output::{
-        LowerOutputExpression, OutputExpression, PaddedOutputSlots, SliceOutput, StageOutput,
-    },
-    read::{Env0, LowerReadExpression, SlotEnvironment},
-    reduce::StageRead,
-    selection::FillOutput,
-    storage::{Concat, FlatLeaves, FlatRow, JoinedRow, Last, More},
-    transform::materialize,
+use crate::api::iter::{
+    MAlloc, MIter, MIterMut, MStorage, MStorageExtent, StorageSlice, StorageSliceMut,
 };
+use crate::core::iter::Zip;
+use crate::core::output::{
+    LowerOutputExpression, OutputExpression, PaddedOutputSlots, SliceOutput, StageOutput,
+};
+use crate::core::read::{
+    Column, Env0, LowerReadExpression, ReadExpression, SlotEnvironment, StageRead,
+};
+use crate::core::runtime::ColumnMut;
+use crate::core::selection::FillOutput;
+use crate::core::storage::{Concat, FlatLeaves, FlatRow, JoinedRow, Last, More, S1, StorageLayout};
+use crate::core::transform::materialize;
+use crate::core::value::MStorageElement;
+use crate::{DeviceVec, Error, Executor};
 
 /// Owned storage that can produce read and mutable output trees.
 pub trait RowStorage<R: Runtime>: Clone + Send + Sync + 'static {
     type Item: StorageLayout;
-    type ReadSlots: SlotEnvironment + crate::read::PaddedReadSlots;
+    type ReadSlots: SlotEnvironment<Arity = <Self::Read as ReadExpression>::ReadArity>
+        + crate::core::read::PaddedReadSlots;
     type WriteSlots: PaddedOutputSlots<Leaves = <Self::Item as StorageLayout>::StorageLeaves>;
     type Read: ReadExpression<Item = Self::Item>
         + LowerReadExpression<Slots = Self::ReadSlots>
@@ -36,10 +40,12 @@ pub trait RowStorage<R: Runtime>: Clone + Send + Sync + 'static {
         + FillOutput<R>;
 
     fn len(&self) -> Result<usize, Error>;
-    fn logical_extent(&self) -> crate::extent::LogicalExtent;
-    fn set_logical_extent(&mut self, extent: crate::extent::LogicalExtent);
+    fn logical_extent(&self) -> crate::core::extent::LogicalExtent;
+    fn set_logical_extent(&mut self, extent: crate::core::extent::LogicalExtent);
     fn read(&self) -> Self::Read;
     fn write(&self) -> Self::Write;
+    /// Uploads one semantic row by composing the physical column transfers.
+    fn from_item(exec: &Executor<R>, value: Self::Item) -> Self;
     fn read_first(&self, exec: &Executor<R>) -> Result<Self::Item, Error>;
     fn slice<Range: RangeBounds<usize>>(&self, range: Range) -> Self::Read;
     fn slice_mut<Range: RangeBounds<usize>>(&self, range: Range) -> Self::Write;
@@ -58,18 +64,18 @@ where
     T: MStorageElement + StorageLayout<StorageArity = S1, StorageLeaves = Last<T>>,
 {
     type Item = T;
-    type ReadSlots = crate::read::Env1<T>;
-    type WriteSlots = crate::read::Env1<T>;
+    type ReadSlots = crate::core::read::Env1<T>;
+    type WriteSlots = crate::core::read::Env1<T>;
     type Read = Column<T>;
     type Write = ColumnMut<T>;
 
     fn len(&self) -> Result<usize, Error> {
         Ok(self.capacity())
     }
-    fn logical_extent(&self) -> crate::extent::LogicalExtent {
+    fn logical_extent(&self) -> crate::core::extent::LogicalExtent {
         DeviceVec::logical_extent(self)
     }
-    fn set_logical_extent(&mut self, extent: crate::extent::LogicalExtent) {
+    fn set_logical_extent(&mut self, extent: crate::core::extent::LogicalExtent) {
         DeviceVec::set_logical_extent(self, extent);
     }
     fn read(&self) -> Self::Read {
@@ -77,6 +83,9 @@ where
     }
     fn write(&self) -> Self::Write {
         self.slice_mut_usize(..)
+    }
+    fn from_item(exec: &Executor<R>, value: Self::Item) -> Self {
+        exec.to_device(&[value])
     }
     fn read_first(&self, exec: &Executor<R>) -> Result<Self::Item, Error> {
         exec.to_host(self)?
@@ -106,11 +115,11 @@ impl<R, T> CopyStorage<R> for DeviceVec<R, T>
 where
     R: Runtime,
     T: MStorageElement + StorageLayout<StorageArity = S1, StorageLeaves = Last<T>>,
-    Column<T>: ReadExpression<Item = T, ReadArity = crate::A1>
-        + LowerReadExpression<Slots = crate::read::Env1<T>>
+    Column<T>: ReadExpression<Item = T, ReadArity = crate::core::arity::A1>
+        + LowerReadExpression<Slots = crate::core::read::Env1<T>>
         + StageRead<R, Env0>,
     ColumnMut<T>: OutputExpression<Item = T, StorageArity = S1>
-        + LowerOutputExpression<Slots = crate::read::Env1<T>>
+        + LowerOutputExpression<Slots = crate::core::read::Env1<T>>
         + StageOutput<R, Env0>,
 {
     fn copy_storage(&self, exec: &Executor<R>, output: Self::Write) -> Result<(), Error> {
@@ -159,12 +168,12 @@ where
         }
     }
 
-    fn logical_extent(&self) -> crate::extent::LogicalExtent {
+    fn logical_extent(&self) -> crate::core::extent::LogicalExtent {
         RowStorage::logical_extent(&self.0)
             .zipped(&RowStorage::logical_extent(&self.1))
             .expect("storage columns have equal logical extents")
     }
-    fn set_logical_extent(&mut self, extent: crate::extent::LogicalExtent) {
+    fn set_logical_extent(&mut self, extent: crate::core::extent::LogicalExtent) {
         RowStorage::set_logical_extent(&mut self.0, extent.clone());
         RowStorage::set_logical_extent(&mut self.1, extent);
     }
@@ -175,6 +184,14 @@ where
     fn write(&self) -> Self::Write {
         Zip::new(self.0.write(), self.1.write())
     }
+    fn from_item(exec: &Executor<R>, value: Self::Item) -> Self {
+        let (left, right) =
+            <Left::Item as StorageLayout>::StorageLeaves::split(value.into_storage_leaves());
+        Zip::new(
+            Left::from_item(exec, Left::Item::from_storage_leaves(left)),
+            Right::from_item(exec, Right::Item::from_storage_leaves(right)),
+        )
+    }
     fn read_first(&self, exec: &Executor<R>) -> Result<Self::Item, Error> {
         let left = self.0.read_first(exec)?.into_storage_leaves();
         let right = self.1.read_first(exec)?.into_storage_leaves();
@@ -183,7 +200,7 @@ where
 
     fn slice<Range: RangeBounds<usize>>(&self, range: Range) -> Self::Read {
         let len = self.len().expect("storage columns have equal lengths");
-        let (start, count) = crate::read::resolve_slice_range(len, range);
+        let (start, count) = crate::core::read::resolve_slice_range(len, range);
         Zip::new(
             self.0.slice(start..start + count),
             self.1.slice(start..start + count),
@@ -192,7 +209,7 @@ where
 
     fn slice_mut<Range: RangeBounds<usize>>(&self, range: Range) -> Self::Write {
         let len = self.len().expect("storage columns have equal lengths");
-        let (start, count) = crate::read::resolve_slice_range(len, range);
+        let (start, count) = crate::core::read::resolve_slice_range(len, range);
         Zip::new(
             self.0.slice_mut(start..start + count),
             self.1.slice_mut(start..start + count),
@@ -705,7 +722,7 @@ where
     where
         Bounds: RangeBounds<crate::MIndex>,
     {
-        let (start, count) = crate::read::resolve_mindex_slice_range(self.capacity(), range);
+        let (start, count) = crate::core::read::resolve_mindex_slice_range(self.capacity(), range);
         crate::DeviceSlice::from_column(self.slice_usize(start..start + count))
     }
 
@@ -713,21 +730,21 @@ where
     where
         Bounds: RangeBounds<crate::MIndex>,
     {
-        let (start, count) = crate::read::resolve_mindex_slice_range(self.capacity(), range);
+        let (start, count) = crate::core::read::resolve_mindex_slice_range(self.capacity(), range);
         crate::DeviceSliceMut::from_output(self.slice_mut_usize(start..start + count))
     }
 }
 
 impl<R: Runtime, T> MStorageExtent<R> for DeviceVec<R, T> {
     fn capacity(&self) -> Result<crate::MIndex, Error> {
-        crate::api::iter::logical_len(self.capacity())
+        crate::api::iter::checked_len(self.capacity())
     }
 
-    fn logical_extent(&self) -> crate::extent::LogicalExtent {
+    fn logical_extent(&self) -> crate::core::extent::LogicalExtent {
         DeviceVec::logical_extent(self)
     }
 
-    fn set_logical_extent(&mut self, extent: crate::extent::LogicalExtent) {
+    fn set_logical_extent(&mut self, extent: crate::core::extent::LogicalExtent) {
         DeviceVec::set_logical_extent(self, extent);
     }
 }
@@ -773,7 +790,7 @@ where
         Bounds: RangeBounds<crate::MIndex>,
     {
         let len = MStorageExtent::capacity(self).expect("storage columns have equal lengths");
-        let (start, count) = crate::read::resolve_mindex_slice_range(len as usize, range);
+        let (start, count) = crate::core::read::resolve_mindex_slice_range(len as usize, range);
         StorageSlice::new(self, start, count)
     }
 
@@ -782,7 +799,7 @@ where
         Bounds: RangeBounds<crate::MIndex>,
     {
         let len = MStorageExtent::capacity(self).expect("storage columns have equal lengths");
-        let (start, count) = crate::read::resolve_mindex_slice_range(len as usize, range);
+        let (start, count) = crate::core::read::resolve_mindex_slice_range(len as usize, range);
         StorageSliceMut::new(self, start, count)
     }
 }
@@ -795,16 +812,16 @@ where
     Self: RowStorage<R>,
 {
     fn capacity(&self) -> Result<crate::MIndex, Error> {
-        crate::api::iter::logical_len(RowStorage::len(self)?)
+        crate::api::iter::checked_len(RowStorage::len(self)?)
     }
 
-    fn logical_extent(&self) -> crate::extent::LogicalExtent {
+    fn logical_extent(&self) -> crate::core::extent::LogicalExtent {
         MStorageExtent::logical_extent(&self.0)
             .zipped(&MStorageExtent::logical_extent(&self.1))
             .expect("storage columns have equal logical extents")
     }
 
-    fn set_logical_extent(&mut self, extent: crate::extent::LogicalExtent) {
+    fn set_logical_extent(&mut self, extent: crate::core::extent::LogicalExtent) {
         MStorageExtent::set_logical_extent(&mut self.0, extent.clone());
         MStorageExtent::set_logical_extent(&mut self.1, extent);
     }
@@ -861,37 +878,6 @@ impl<R: Runtime> Executor<R> {
     }
 }
 
-/// Normalizes a sortable expression into its canonical owned row storage.
-pub(crate) trait NormalizeOwnedInput<R: Runtime>: ReadExpression + Sized {
-    type OwnedStorage: RowStorage<R>;
-
-    fn normalize_owned(self, exec: &Executor<R>) -> Result<Self::OwnedStorage, Error>;
-}
-
-impl<R, Input> NormalizeOwnedInput<R> for Input
-where
-    R: Runtime,
-    Input: ReadExpression + LowerReadExpression + StageRead<R, Env0>,
-    Input::Item: RowAlloc<R>,
-    <Input::Item as StorageLayout>::StorageLeaves: crate::storage::StorePadded12,
-    <<Input::Item as StorageLayout>::StorageLeaves as cubecl::prelude::CubeType>::ExpandType:
-        crate::storage::StorePadded12Expand,
-    <Input::Item as RowAlloc<R>>::RowStorage: RowStorage<R>,
-    <<Input::Item as RowAlloc<R>>::RowStorage as RowStorage<R>>::Write:
-        OutputExpression<Item = Input::Item>,
-{
-    type OwnedStorage = <Input::Item as RowAlloc<R>>::RowStorage;
-
-    fn normalize_owned(self, exec: &Executor<R>) -> Result<Self::OwnedStorage, Error> {
-        let len = self.logical_len()?;
-        let extent = self.logical_extent()?;
-        let mut storage = exec.alloc_row::<Input::Item>(len);
-        storage.set_logical_extent(extent);
-        materialize(exec, self, storage.write())?;
-        Ok(storage)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,7 +903,7 @@ mod tests {
             b.column(),
             c.column(),
         ));
-        crate::transform::materialize(&exec, input, storage.write()).unwrap();
+        crate::core::transform::materialize(&exec, input, storage.write()).unwrap();
 
         let (a, b, c) = MStorage::into_columns(storage);
         assert_eq!(exec.to_host(&a).unwrap(), vec![1, 2, 3]);

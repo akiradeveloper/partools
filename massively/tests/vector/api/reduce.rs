@@ -16,6 +16,15 @@ impl UnaryOp<(f32, f32)> for DetectHit {
 
 struct CountHit;
 
+struct LessIndex;
+
+#[cubecl::cube]
+impl massively::op::BinaryPredicateOp<u32> for LessIndex {
+    fn apply(lhs: u32, rhs: u32) -> massively::MFlag {
+        massively::flag::from_bool(lhs < rhs)
+    }
+}
+
 #[cubecl::cube]
 impl ReductionOp<u32> for CountHit {
     fn apply(lhs: u32, rhs: u32) -> u32 {
@@ -62,19 +71,25 @@ fn reduce_estimates_pi_from_lazy_random_map_4g() {
 
 #[test]
 #[ignore = "4G-scale regression test; run explicitly on a GPU-capable machine"]
-fn reduce_counts_four_billion_lazy_constants() {
+fn reduce_counts_large_lazy_constants_through_index_limit() {
     let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
-    let len = 4_000_000_000_usize;
+    // The middle size needs 524,287 blocks: a prime count that exercises
+    // rounded multidimensional dispatch near the end of the u32 domain.
+    for len in [4_000_000_000_u32, u32::MAX - 16_382, u32::MAX] {
+        let count = reduce(&exec, lazy::constant(1_u32).take(len), 13_u32, CountHit).unwrap();
+        assert_eq!(count, len.wrapping_add(13), "len={len}");
+    }
+}
 
-    let count = reduce(
-        &exec,
-        lazy::constant(1_u32).take(len as massively::MIndex),
-        0_u32,
-        CountHit,
-    )
-    .unwrap();
-
-    assert_eq!(count, len as u32);
+#[test]
+#[ignore = "4G-scale regression test; run explicitly on a GPU-capable machine"]
+fn extremum_index_respects_the_last_partial_tile_at_the_index_limit() {
+    let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
+    for len in [u32::MAX - 16_382, u32::MAX] {
+        let index =
+            massively::vector::max_element(&exec, lazy::counting(0).take(len), LessIndex).unwrap();
+        assert_eq!(index, Some(len - 1));
+    }
 }
 
 #[test]

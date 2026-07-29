@@ -2,10 +2,9 @@
 
 use cubecl::prelude::*;
 
-use crate::{
-    Error, Executor, MAlloc, MFlag, MIndex, MIter, MIterMut, MStorage, MVec,
-    api::iter::MStorageExtent, op::BinaryPredicateOp,
-};
+use crate::api::iter::MStorageExtent;
+use crate::op::BinaryPredicateOp;
+use crate::{Error, Executor, MAlloc, MFlag, MIndex, MIter, MIterMut, MStorage, MVec};
 
 struct UniqueOperation<'a, R: Runtime, Input, Equal> {
     exec: &'a Executor<R>,
@@ -25,10 +24,10 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        crate::ordering::unique(
+        crate::core::ordering::unique(
             self.exec,
             crate::api::iter::lower_fixed::<R, _>(self.input),
             self.equal,
@@ -114,8 +113,11 @@ where
     Input: MIter<R>,
     Equal: BinaryPredicateOp<Input::Item>,
 {
-    let value =
-        crate::ordering::adjacent_find(exec, crate::api::iter::lower_fixed::<R, _>(input), equal)?;
+    let value = crate::core::ordering::adjacent_find(
+        exec,
+        crate::api::iter::lower_fixed::<R, _>(input),
+        equal,
+    )?;
     crate::api::value::read_optional_index(exec, &value)
 }
 
@@ -157,7 +159,7 @@ where
     let capacity = input.capacity()?;
     let mut output = exec.alloc::<Item>(capacity);
     let len = unique_into(exec, input, equal, output.slice_mut(..))?;
-    output.set_logical_extent(crate::extent::LogicalExtent::from_device(
+    output.set_logical_extent(crate::core::extent::LogicalExtent::from_device(
         &len,
         capacity as usize,
     ));
@@ -221,8 +223,11 @@ where
     Less: BinaryPredicateOp<Input::Item>,
 {
     let len = input.capacity()?;
-    let index =
-        crate::ordering::is_sorted_until(exec, crate::api::iter::lower_fixed::<R, _>(input), less)?;
+    let index = crate::core::ordering::is_sorted_until(
+        exec,
+        crate::api::iter::lower_fixed::<R, _>(input),
+        less,
+    )?;
     let index = crate::api::value::read::<R, MIndex>(exec, &index)?;
     Ok(if index == MIndex::MAX { len } else { index })
 }
@@ -264,7 +269,7 @@ where
     Less: BinaryPredicateOp<Input::Item>,
 {
     let index =
-        crate::ordering::is_sorted(exec, crate::api::iter::lower_fixed::<R, _>(input), less)?;
+        crate::core::ordering::is_sorted(exec, crate::api::iter::lower_fixed::<R, _>(input), less)?;
     let index = crate::api::value::read::<R, MIndex>(exec, &index)?;
     Ok(crate::flag::from_bool(index == MIndex::MAX))
 }
@@ -282,8 +287,11 @@ macro_rules! extremum_api {
             Input: MIter<R>,
             Less: BinaryPredicateOp<Input::Item>,
         {
-            let value =
-                crate::ordering::$name(exec, crate::api::iter::lower_fixed::<R, _>(input), less)?;
+            let value = crate::core::ordering::$name(
+                exec,
+                crate::api::iter::lower_fixed::<R, _>(input),
+                less,
+            )?;
             crate::api::value::read_optional_index(exec, &value)
         }
     };
@@ -368,12 +376,12 @@ macro_rules! minmax_api {
             Input: MIter<R>,
             Less: BinaryPredicateOp<Input::Item>,
         {
-            let (minimum, maximum) = crate::ordering::minmax_element(
+            let (minimum, maximum) = crate::core::ordering::minmax_element(
                 exec,
                 crate::api::iter::lower_fixed::<R, _>(input),
                 less,
             )?;
-            let pair: MVec<R, (MIndex, MIndex)> = crate::Zip::new(minimum, maximum);
+            let pair: MVec<R, (MIndex, MIndex)> = crate::core::iter::Zip::new(minimum, maximum);
             crate::api::value::read_optional_index_pair(exec, &pair)
         }
     };

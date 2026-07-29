@@ -2,26 +2,32 @@
 
 #![allow(private_interfaces)]
 
+mod staging;
+pub use staging::StageRead;
+
 use core::marker::PhantomData;
 use cubecl::prelude::*;
 use std::ops::{Bound, RangeBounds};
 
-use crate::{
-    MIndex, Zip,
-    arity::{A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, AddArity, ReadArity},
-    eval::{
-        AdjacentExpr, AdjacentIndexedTransformExpr, Broadcast, Count, DeviceExpr, Direct,
-        DivModCount, Eval13, IndexedTransformExpr, PermuteExpr, ReverseCount, SegmentIteratorExpr,
-        Slot0, Slot1, Slot2, Slot3, Slot4, Slot5, Slot6, Slot7, Slot8, Slot9, Slot10, Slot11,
-        Slot12, StrideCount, TransformExpr, ZipExpr,
-    },
-    extent::LogicalExtent,
-    op::{IndexedBinaryOp, IndexedUnaryOp, UnaryOp},
-    reduce::ReductionOp,
-    seg::Segment,
-    storage::{Concat, JoinedReadRow, ReadFlatLeaves, ReadLayout, ReadRow, StorageLayout},
-    value::MStorageElement,
+use crate::MIndex;
+use crate::core::arity::{
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, AddArity, ReadArity,
 };
+use crate::core::eval::{
+    AdjacentExpr, AdjacentIndexedTransformExpr, Broadcast, Count, DeviceExpr, Direct, DivModCount,
+    Eval13, Eval13At, IndexedTransformExpr, PermuteExpr, RepeatExpr, ReverseCount,
+    SegmentIteratorExpr, Slot0, Slot1, Slot2, Slot3, Slot4, Slot5, Slot6, Slot7, Slot8, Slot9,
+    Slot10, Slot11, Slot12, StrideCount, TransformExpr, ZipExpr,
+};
+use crate::core::extent::LogicalExtent;
+use crate::core::iter::Zip;
+use crate::core::op::ReductionOp;
+use crate::core::storage::{
+    Concat, JoinedReadRow, ReadFlatLeaves, ReadLayout, ReadRow, StorageLayout,
+};
+use crate::core::value::MStorageElement;
+use crate::op::{IndexedBinaryOp, IndexedUnaryOp, UnaryOp};
+use crate::seg::Segment;
 
 /// Internal runtime-erased contiguous device read leaf.
 #[doc(hidden)]
@@ -427,6 +433,20 @@ pub struct Permute<Values, Indices> {
     pub indices: Indices,
 }
 
+/// A finite expression that repeats the first row of its input.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug)]
+pub struct Repeat<Input> {
+    pub(crate) input: Input,
+    pub(crate) len: usize,
+}
+
+impl<Input> Repeat<Input> {
+    pub const fn new(input: Input, len: usize) -> Self {
+        Self { input, len }
+    }
+}
+
 impl<Values, Indices> Permute<Values, Indices> {
     pub const fn new(values: Values, indices: Indices) -> Self {
         Self { values, indices }
@@ -574,6 +594,14 @@ where
 {
     type Item = Values::Item;
     type ReadArity = <Values::ReadArity as AddArity<Indices::ReadArity>>::Output;
+}
+
+impl<Input> ReadExpression for Repeat<Input>
+where
+    Input: ReadExpression,
+{
+    type Item = Input::Item;
+    type ReadArity = Input::ReadArity;
 }
 
 impl<Values> ReadExpression for Reverse<Values>
@@ -978,7 +1006,7 @@ impl<Input, Op, Env> BindSlots<Env> for Adjacent<Input, Op>
 where
     Input: ReadExpression + BindSlots<Env>,
     Input::Item: StorageLayout,
-    <Input::Item as StorageLayout>::StorageLeaves: crate::storage::SelectLeaves,
+    <Input::Item as StorageLayout>::StorageLeaves: crate::core::storage::SelectLeaves,
     Op: ReductionOp<Input::Item>,
 {
     type Expr = AdjacentExpr<
@@ -998,6 +1026,14 @@ where
 {
     type Expr = PermuteExpr<Values::Expr, Indices::Expr>;
     type NextEnv = Indices::NextEnv;
+}
+
+impl<Input, Env> BindSlots<Env> for Repeat<Input>
+where
+    Input: BindSlots<Env>,
+{
+    type Expr = RepeatExpr<Input::Expr>;
+    type NextEnv = Input::NextEnv;
 }
 
 impl<Values, Env> BindSlots<Env> for Reverse<Values>
@@ -1122,11 +1158,24 @@ pub type KernelReadSlots<Slots> = Env13<
 /// The wrapped device expression still evaluates only its real leaves.
 #[doc(hidden)]
 #[derive(Clone)]
-pub struct FixedRead<Input>(pub Input);
+pub struct FixedRead<Input> {
+    input: Input,
+    extent: Option<LogicalExtent>,
+}
 
 impl<Input> FixedRead<Input> {
     pub fn new(input: Input) -> Self {
-        Self(input)
+        Self {
+            input,
+            extent: None,
+        }
+    }
+
+    /// Narrows a consumer to an already validated common logical extent.
+    /// This changes host scheduling metadata, not the device expression or ABI.
+    pub(crate) fn with_logical_extent(mut self, extent: LogicalExtent) -> Self {
+        self.extent = Some(extent);
+        self
     }
 }
 
@@ -1145,31 +1194,6 @@ where
 {
     type Expr = Input::DeviceExpr;
     type NextEnv = KernelReadSlots<Input::Slots>;
-}
-
-impl<R, Input> crate::reduce::StageRead<R, Env0> for FixedRead<Input>
-where
-    R: cubecl::prelude::Runtime,
-    Input: LowerReadExpression + crate::reduce::StageRead<R, Env0>,
-{
-    fn logical_len(&self) -> Result<usize, crate::Error> {
-        crate::reduce::StageRead::logical_len(&self.0)
-    }
-
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, crate::Error> {
-        crate::reduce::StageRead::logical_extent(&self.0)
-    }
-
-    fn stage_at(
-        &self,
-        client: &ComputeClient<R>,
-        owner: u64,
-        bindings: &mut crate::reduce::StagedBindings,
-    ) -> Result<(), crate::Error> {
-        crate::reduce::StageRead::stage_at(&self.0, client, owner, bindings)?;
-        bindings.pad_to_thirteen(client);
-        Ok(())
-    }
 }
 
 macro_rules! impl_padded_read_slots {
@@ -1221,10 +1245,11 @@ impl_padded_read_slots!(Env13<L0,L1,L2,L3,L4,L5,L6,L7,L8,L9,L10,L11,L12>; [L0,L1
 
 /// Fully bound form of a read expression.
 ///
-/// `Slots` retains the recursively computed [`ReadArity`].  The `Eval13`
-/// requirement only says that this exact expression can be evaluated by the
-/// current padded ABI; it does not widen the expression.  The actual arity is
-/// erased only when [`FixedRead`] is constructed by a consumer.
+/// `Slots` retains the recursively computed [`ReadArity`]. The fixed-evaluator
+/// requirements only say that this exact expression can be evaluated by the
+/// padded ABI (including from a shared offset table); they do not widen the
+/// expression. The actual arity is erased only when [`FixedRead`] is
+/// constructed by a consumer.
 #[doc(hidden)]
 pub trait LowerReadExpression:
     ReadExpression + BindSlots<Env0, NextEnv = Self::Slots, Expr = Self::DeviceExpr>
@@ -1232,6 +1257,21 @@ pub trait LowerReadExpression:
     type Slots: SlotEnvironment<Arity = Self::ReadArity> + PaddedReadSlots;
     type DeviceExpr: DeviceExpr<Self::Item>
         + Eval13<
+            Self::Item,
+            <Self::Slots as PaddedReadSlots>::L0,
+            <Self::Slots as PaddedReadSlots>::L1,
+            <Self::Slots as PaddedReadSlots>::L2,
+            <Self::Slots as PaddedReadSlots>::L3,
+            <Self::Slots as PaddedReadSlots>::L4,
+            <Self::Slots as PaddedReadSlots>::L5,
+            <Self::Slots as PaddedReadSlots>::L6,
+            <Self::Slots as PaddedReadSlots>::L7,
+            <Self::Slots as PaddedReadSlots>::L8,
+            <Self::Slots as PaddedReadSlots>::L9,
+            <Self::Slots as PaddedReadSlots>::L10,
+            <Self::Slots as PaddedReadSlots>::L11,
+            <Self::Slots as PaddedReadSlots>::L12,
+        > + Eval13At<
             Self::Item,
             <Self::Slots as PaddedReadSlots>::L0,
             <Self::Slots as PaddedReadSlots>::L1,
@@ -1269,6 +1309,21 @@ where
             <Input::NextEnv as PaddedReadSlots>::L10,
             <Input::NextEnv as PaddedReadSlots>::L11,
             <Input::NextEnv as PaddedReadSlots>::L12,
+        > + Eval13At<
+            <Input as ReadExpression>::Item,
+            <Input::NextEnv as PaddedReadSlots>::L0,
+            <Input::NextEnv as PaddedReadSlots>::L1,
+            <Input::NextEnv as PaddedReadSlots>::L2,
+            <Input::NextEnv as PaddedReadSlots>::L3,
+            <Input::NextEnv as PaddedReadSlots>::L4,
+            <Input::NextEnv as PaddedReadSlots>::L5,
+            <Input::NextEnv as PaddedReadSlots>::L6,
+            <Input::NextEnv as PaddedReadSlots>::L7,
+            <Input::NextEnv as PaddedReadSlots>::L8,
+            <Input::NextEnv as PaddedReadSlots>::L9,
+            <Input::NextEnv as PaddedReadSlots>::L10,
+            <Input::NextEnv as PaddedReadSlots>::L11,
+            <Input::NextEnv as PaddedReadSlots>::L12,
         >,
 {
     type DeviceExpr = Input::Expr;
@@ -1278,10 +1333,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        eval::*,
-        op::{Identity, UnaryOp},
-    };
+    use crate::core::eval::*;
+    use crate::op::{Identity, UnaryOp};
     use static_assertions::assert_impl_all;
 
     type One = Column<u8>;
@@ -1374,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn binding_is_left_to_right_and_selects_eval8() {
+    fn binding_is_left_to_right_before_fixed_abi_padding() {
         fn assert_binding<E, Expr, Slots>()
         where
             E: BindSlots<Env0, Expr = Expr, NextEnv = Slots>
@@ -1402,7 +1455,7 @@ mod tests {
 
     #[cubecl::cube]
     #[allow(dead_code)]
-    fn cubecl_compiles_eval8(
+    fn cubecl_compiles_fixed_evaluator(
         slot0: &[u8],
         slot1: &[u16],
         slot2: &[u32],
@@ -1411,16 +1464,22 @@ mod tests {
         slot5: &[i16],
         slot6: &[i32],
         slot7: &[u32],
+        slot8: &[u32],
+        slot9: &[u32],
+        slot10: &[u32],
+        slot11: &[u32],
+        slot12: &[u32],
         offsets: &[u32],
         index: usize,
     ) -> SevenItem {
-        LazifiedDevice::eval8(
-            slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, offsets, index,
+        LazifiedDevice::eval13(
+            slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10, slot11,
+            slot12, offsets, index,
         )
     }
 
     #[cubecl::cube(launch_unchecked)]
-    fn eval8_runtime_kernel(
+    fn fixed_eval_runtime_kernel(
         slot0: &[u32],
         slot1: &[u32],
         slot2: &[u32],
@@ -1429,33 +1488,53 @@ mod tests {
         slot5: &[u32],
         slot6: &[u32],
         slot7: &[u32],
+        slot8: &[u32],
+        slot9: &[u32],
+        slot10: &[u32],
+        slot11: &[u32],
+        slot12: &[u32],
         offsets: &[u32],
         output: &mut [u32],
     ) {
         let index = ABSOLUTE_POS as usize;
         if index < output.len() {
-            let value = RuntimeLazifiedDevice::eval8(
-                slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, offsets, index,
+            let value = RuntimeLazifiedDevice::eval13(
+                slot0, slot1, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10,
+                slot11, slot12, offsets, index,
             );
             output[index] = value.0 + value.1 + value.2 + value.3 + value.4 + value.5 + value.6;
         }
     }
 
     #[cubecl::cube(launch_unchecked)]
-    fn eval2_modes_runtime_kernel(
+    fn padded_modes_runtime_kernel(
         constant: &[u32],
         counting: &[u32],
+        slot2: &[u32],
+        slot3: &[u32],
+        slot4: &[u32],
+        slot5: &[u32],
+        slot6: &[u32],
+        slot7: &[u32],
+        slot8: &[u32],
+        slot9: &[u32],
+        slot10: &[u32],
+        slot11: &[u32],
+        slot12: &[u32],
         offsets: &[u32],
         output: &mut [u32],
     ) {
         let index = ABSOLUTE_POS as usize;
         if index < output.len() {
-            output[index] = RuntimeMixedDevice::eval2(constant, counting, offsets, index);
+            output[index] = RuntimeMixedDevice::eval13(
+                constant, counting, slot2, slot3, slot4, slot5, slot6, slot7, slot8, slot9, slot10,
+                slot11, slot12, offsets, index,
+            );
         }
     }
 
     #[test]
-    fn eval8_executes_nested_zip_permute_and_transform_on_cubecl() {
+    fn fixed_evaluator_executes_padded_expressions_on_cubecl() {
         use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
         let client = WgpuRuntime::client(&WgpuDevice::DefaultDevice);
@@ -1470,11 +1549,12 @@ mod tests {
         ];
         let handles = columns.map(|column| client.create_from_slice(u32::as_bytes(&column)));
         let count = client.create_from_slice(u32::as_bytes(&[1]));
+        let dummy = client.empty(size_of::<u32>());
         let offsets = client.create_from_slice(u32::as_bytes(&[0, 1, 2, 0, 1, 2, 0, 0]));
         let output = client.empty(2 * size_of::<u32>());
 
         unsafe {
-            eval8_runtime_kernel::launch_unchecked::<WgpuRuntime>(
+            fixed_eval_runtime_kernel::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_1d(2),
@@ -1486,6 +1566,11 @@ mod tests {
                 BufferArg::from_raw_parts(handles[5].clone(), columns[5].len()),
                 BufferArg::from_raw_parts(handles[6].clone(), columns[6].len()),
                 BufferArg::from_raw_parts(count, 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
                 BufferArg::from_raw_parts(offsets, 8),
                 BufferArg::from_raw_parts(output.clone(), 2),
             );
@@ -1500,12 +1585,23 @@ mod tests {
         let offsets = client.create_from_slice(u32::as_bytes(&[99, 3]));
         let output = client.empty(2 * size_of::<u32>());
         unsafe {
-            eval2_modes_runtime_kernel::launch_unchecked::<WgpuRuntime>(
+            padded_modes_runtime_kernel::launch_unchecked::<WgpuRuntime>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_1d(2),
                 BufferArg::from_raw_parts(constant, 1),
                 BufferArg::from_raw_parts(counting, 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy.clone(), 1),
+                BufferArg::from_raw_parts(dummy, 1),
                 BufferArg::from_raw_parts(offsets, 2),
                 BufferArg::from_raw_parts(output.clone(), 2),
             );
