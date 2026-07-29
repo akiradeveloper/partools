@@ -259,9 +259,9 @@ fn radix_sort_by_key_handles_empty_and_rejects_length_mismatch() {
 }
 
 #[test]
-fn radix_sort_by_key_crosses_scan_block_boundaries_stably() {
+fn radix_sort_by_key_crosses_macro_block_boundaries_stably() {
     let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
-    let len = 513;
+    let len = 6_145;
     let keys: Vec<u32> = (0..len).map(|index| ((index * 37) % 11) as u32).collect();
     let values: Vec<u32> = (0..len as u32).collect();
     let key_device = exec.to_device(&keys);

@@ -2,11 +2,15 @@
 
 use cubecl::prelude::*;
 
-use crate::{Error, MIndex, Zip, lazy};
+use crate::core::iter::Zip;
+use crate::{Error, MIndex, lazy};
 
 type RandomInput<T> = Zip<
-    Zip<Zip<crate::read::Counting, crate::read::Constant<T>>, crate::read::Constant<T>>,
-    crate::read::Constant<u32>,
+    Zip<
+        Zip<crate::core::read::Counting, crate::core::read::Constant<T>>,
+        crate::core::read::Constant<T>,
+    >,
+    crate::core::read::Constant<u32>,
 >;
 
 fn pcg_hash32_host(input: u32) -> u32 {
@@ -64,24 +68,24 @@ macro_rules! uniform_stream {
             }
         }
 
-        impl crate::read::TakenSource for $stream {
-            type Read = crate::read::Transform<RandomInput<$item>, $op>;
+        impl crate::core::read::TakenSource for $stream {
+            type Read = crate::core::read::Transform<RandomInput<$item>, $op>;
 
             fn lower(&self, offset: usize, len: usize) -> Self::Read {
-                crate::read::Transform::new(
+                crate::core::read::Transform::new(
                     Zip::new(
                         Zip::new(
                             Zip::new(
-                                crate::read::Counting::new(
+                                crate::core::read::Counting::new(
                                     u32::try_from(offset)
                                         .expect("random stream offset exceeds device u32 range"),
                                     len,
                                 ),
-                                crate::read::Constant::new(self.min, len),
+                                crate::core::read::Constant::new(self.min, len),
                             ),
-                            crate::read::Constant::new(self.max, len),
+                            crate::core::read::Constant::new(self.max, len),
                         ),
-                        crate::read::Constant::new(self.key, len),
+                        crate::core::read::Constant::new(self.key, len),
                     ),
                     $op,
                 )
@@ -195,24 +199,24 @@ macro_rules! normal_stream {
             }
         }
 
-        impl crate::read::TakenSource for $stream {
-            type Read = crate::read::Transform<RandomInput<$item>, $op>;
+        impl crate::core::read::TakenSource for $stream {
+            type Read = crate::core::read::Transform<RandomInput<$item>, $op>;
 
             fn lower(&self, offset: usize, len: usize) -> Self::Read {
-                crate::read::Transform::new(
+                crate::core::read::Transform::new(
                     Zip::new(
                         Zip::new(
                             Zip::new(
-                                crate::read::Counting::new(
+                                crate::core::read::Counting::new(
                                     u32::try_from(offset)
                                         .expect("random stream offset exceeds device u32 range"),
                                     len,
                                 ),
-                                crate::read::Constant::new(self.mean, len),
+                                crate::core::read::Constant::new(self.mean, len),
                             ),
-                            crate::read::Constant::new(self.stddev, len),
+                            crate::core::read::Constant::new(self.stddev, len),
                         ),
-                        crate::read::Constant::new(self.key, len),
+                        crate::core::read::Constant::new(self.key, len),
                     ),
                     $op,
                 )
@@ -349,7 +353,7 @@ fn random_u64_at(key: u32, index: u32, stream: u32) -> u64 {
 
 #[cubecl::cube]
 fn unit_f32(key: u32, index: u32, stream: u32) -> f32 {
-    ((random_u32_at(key, index, stream) >> 8u32) as f32) * 0.00000005960464832810486063f32
+    ((random_u32_at(key, index, stream) >> 8u32) as f32) * 0.000_000_059_604_65_f32
 }
 
 #[cubecl::cube]
@@ -359,8 +363,7 @@ fn unit_f64(key: u32, index: u32, stream: u32) -> f64 {
 
 #[cubecl::cube]
 fn open_unit_f32(key: u32, index: u32, stream: u32) -> f32 {
-    (((random_u32_at(key, index, stream) >> 8u32) as f32) + 0.5f32)
-        * 0.00000005960464832810486063f32
+    (((random_u32_at(key, index, stream) >> 8u32) as f32) + 0.5f32) * 0.000_000_059_604_65_f32
 }
 
 #[cubecl::cube]
@@ -400,7 +403,7 @@ fn normal_f32_value(mean: f32, stddev: f32, key: u32, index: u32) -> f32 {
     let u1 = open_unit_f32(key, index, 0u32);
     let u2 = open_unit_f32(key, index, 0x9e37_79b9u32);
     let radius = (-2.0f32 * u1.ln()).sqrt();
-    let angle = 6.28318530717958647692f32 * u2;
+    let angle = core::f32::consts::TAU * u2;
     mean + stddev * radius * angle.cos()
 }
 
@@ -409,6 +412,6 @@ fn normal_f64_value(mean: f64, stddev: f64, key: u32, index: u32) -> f64 {
     let u1 = open_unit_f32(key, index, 0u32);
     let u2 = open_unit_f32(key, index, 0x9e37_79b9u32);
     let radius = (-2.0f32 * u1.ln()).sqrt();
-    let angle = 6.28318530717958647692f32 * u2;
+    let angle = core::f32::consts::TAU * u2;
     mean + stddev * ((radius * angle.cos()) as f64)
 }

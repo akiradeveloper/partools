@@ -2,17 +2,17 @@
 
 use cubecl::prelude::*;
 
-use crate::{
-    Error, Executor, ReadExpression, StorageLayout, Transform,
-    eval::Eval13,
-    op::UnaryOp,
-    output::{
-        LowerOutputExpression, OutputBindings, OutputExpression, PaddedOutputSlots, StageOutput,
-    },
-    read::{Env0, LowerReadExpression, PaddedReadSlots},
-    reduce::{StageRead, StagedBindings},
-    storage::{Decompose, StorePadded12, StorePadded12Expand},
+use crate::core::bindings::Bindings;
+use crate::core::eval::Eval13;
+use crate::core::output::{
+    LowerOutputExpression, OutputExpression, PaddedOutputSlots, StageOutput,
 };
+use crate::core::read::{
+    Env0, LowerReadExpression, PaddedReadSlots, ReadExpression, StageRead, Transform,
+};
+use crate::core::storage::{Decompose, StorageLayout, StorePadded12, StorePadded12Expand};
+use crate::op::UnaryOp;
+use crate::{Error, Executor};
 
 const BLOCK_SIZE: u32 = 256;
 
@@ -21,19 +21,19 @@ macro_rules! define_padded_materialize_kernel {
         #[cubecl::cube(launch_unchecked, explicit_define)]
         fn $name<
             Item: CubeType + Send + Sync + 'static,
-            $( $leaf: CubePrimitive, )+
-            O0: CubePrimitive,
-            O1: CubePrimitive,
-            O2: CubePrimitive,
-            O3: CubePrimitive,
-            O4: CubePrimitive,
-            O5: CubePrimitive,
-            O6: CubePrimitive,
-            O7: CubePrimitive,
-            O8: CubePrimitive,
-            O9: CubePrimitive,
-            O10: CubePrimitive,
-            O11: CubePrimitive,
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
+            O0: CubePrimitive + cubecl::frontend::Scalar,
+            O1: CubePrimitive + cubecl::frontend::Scalar,
+            O2: CubePrimitive + cubecl::frontend::Scalar,
+            O3: CubePrimitive + cubecl::frontend::Scalar,
+            O4: CubePrimitive + cubecl::frontend::Scalar,
+            O5: CubePrimitive + cubecl::frontend::Scalar,
+            O6: CubePrimitive + cubecl::frontend::Scalar,
+            O7: CubePrimitive + cubecl::frontend::Scalar,
+            O8: CubePrimitive + cubecl::frontend::Scalar,
+            O9: CubePrimitive + cubecl::frontend::Scalar,
+            O10: CubePrimitive + cubecl::frontend::Scalar,
+            O11: CubePrimitive + cubecl::frontend::Scalar,
             Leaves: CubeType + Send + Sync + 'static
                 + StorePadded12<
                     O0 = O0, O1 = O1, O2 = O2, O3 = O3, O4 = O4, O5 = O5,
@@ -109,8 +109,8 @@ where
     Output: OutputExpression<Item = Input::Item> + LowerOutputExpression + StageOutput<R, Env0>,
     Output::Slots: PaddedOutputSlots<Leaves = <Input::Item as StorageLayout>::StorageLeaves>,
 {
-    let input_len = input.logical_len()?;
-    let output_len = output.logical_len()?;
+    let input_len = input.physical_len()?;
+    let output_len = output.physical_len()?;
     if output_len < input_len {
         return Err(Error::OutputTooShort {
             input: input_len,
@@ -121,12 +121,8 @@ where
         return Ok(());
     }
     let len = u32::try_from(input_len).map_err(|_| Error::LengthTooLarge { len: input_len })?;
-    let mut reads = StagedBindings::new();
-    input.stage_at(exec.client(), exec.id(), &mut reads)?;
-    reads.pad_to_thirteen(exec.client());
-    let mut writes = OutputBindings::new();
-    output.stage_output(exec.id(), &mut writes)?;
-    writes.pad_to_twelve(exec.client());
+    let reads = Bindings::read(exec, input)?;
+    let writes = Bindings::write(exec, output)?;
     let read_offsets = exec
         .client()
         .create_from_slice(u32::as_bytes(&reads.offsets));
@@ -134,11 +130,11 @@ where
         .client()
         .create_from_slice(u32::as_bytes(&writes.offsets));
     let logical_len = match active_len {
-        Some(active_len) => crate::extent::LogicalExtent::from_device(active_len, input_len),
+        Some(active_len) => crate::core::extent::LogicalExtent::from_device(active_len, input_len),
         None => input.logical_extent()?,
     }
     .materialize(exec)?;
-    let cubes = crate::launch::cube_count_1d((len as usize).div_ceil(BLOCK_SIZE as usize))?;
+    let cubes = crate::core::launch::cube_count_1d((len as usize).div_ceil(BLOCK_SIZE as usize))?;
     unsafe {
         materialize_a13::launch_unchecked::<
             Input::Item,
@@ -282,7 +278,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Counting, DeviceVec, Permute, Zip};
+    use crate::DeviceVec;
+    use crate::core::iter::Zip;
+    use crate::core::read::{Counting, Permute};
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
     struct Double;
@@ -293,6 +291,64 @@ mod tests {
         fn apply(input: u32) -> u32 {
             input * 2
         }
+    }
+
+    #[test]
+    fn generated_materialization_fits_the_binding_budget() {
+        type ScalarLeaves = <u32 as StorageLayout>::StorageLeaves;
+        type ScalarExpr = <crate::core::read::Column<u32> as LowerReadExpression>::DeviceExpr;
+        type ScalarLayout = <u32 as StorageLayout>::DeviceLayout;
+        type Kernel = materialize_a13::MaterializeA13<
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            ScalarLeaves,
+            ScalarExpr,
+            ScalarLayout,
+            WgpuRuntime,
+        >;
+
+        let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
+        let settings = KernelSettings::new(
+            CubeDim::new_1d(BLOCK_SIZE).into(),
+            ExecutionMode::Unchecked,
+            AddressType::U32,
+        );
+        let mut launcher = KernelLauncher::<WgpuRuntime>::new(settings.clone());
+        let handle = exec.client().empty(core::mem::size_of::<u32>());
+        let arg = unsafe {
+            <[u32] as LaunchArg>::register(BufferArg::from_raw_parts(handle, 1), &mut launcher)
+        };
+        let kernel = crate::core::launch::kernel_with_max_explicit_storage_bindings!(
+            Kernel,
+            settings,
+            exec.client().clone(),
+            arg
+        );
+        crate::core::launch::assert_binding_budget("materialization", &kernel);
     }
 
     #[test]

@@ -1,7 +1,9 @@
 use cubecl::prelude::*;
 use std::ops::RangeBounds;
 
-use crate::{DeviceSlice, DeviceVec, Error, Executor, MIndex, MIter, api::iter::MIterExtent};
+use crate::api::iter::MIterExtent;
+use crate::core::read::SliceExpression;
+use crate::{DeviceSlice, DeviceVec, Error, Executor, MIndex, MIter};
 
 use super::{ExclusiveScan, Executable, ForEachSegment, SegmentIterator};
 
@@ -163,7 +165,7 @@ impl<R: Runtime> MIterExtent<R> for Segmentation<R> {
         Ok(self.offsets.len())
     }
 
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
+    fn logical_extent(&self) -> Result<crate::core::extent::LogicalExtent, Error> {
         self.offsets.slice(..).logical_extent()
     }
 }
@@ -188,7 +190,7 @@ impl<R: Runtime> Segmentation<R> {
     where
         Offsets: MIter<R, Item = MIndex>,
     {
-        let offsets = crate::api::iter::materialize_exact_u32(exec, offsets)?;
+        let offsets = crate::api::materialize::exact(exec, offsets)?;
         if offsets.is_empty() {
             return Err(Error::InvalidSegmentation);
         }
@@ -198,7 +200,7 @@ impl<R: Runtime> Segmentation<R> {
         unsafe {
             validate_offsets_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (offset_count as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -225,7 +227,7 @@ impl<R: Runtime> Segmentation<R> {
     where
         Lengths: MIter<R, Item = MIndex>,
     {
-        let segment_count = lengths.capacity()?;
+        let segment_count = crate::api::iter::checked_len(lengths.logical_extent()?.read(exec)?)?;
         let offset_count = checked_offset_count(segment_count)?;
         if segment_count == 0 {
             return Ok(Self {
@@ -234,6 +236,9 @@ impl<R: Runtime> Segmentation<R> {
             });
         }
 
+        let lengths = lengths
+            .lower_read()
+            .slice_expression(0, segment_count as usize);
         let prefix = crate::vector::inclusive_scan(exec, lengths, super::control::SumU32)?;
         let offsets =
             exec.alloc::<u32>(MIndex::try_from(offset_count).expect("offset count was validated"));
@@ -241,7 +246,7 @@ impl<R: Runtime> Segmentation<R> {
         unsafe {
             offsets_from_prefix_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (segment_count as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -253,7 +258,7 @@ impl<R: Runtime> Segmentation<R> {
         let status = exec.to_host(&status)?;
         if status[0] != 0 {
             return Err(Error::LengthTooLarge {
-                len: (u32::MAX as usize).checked_add(1).unwrap_or(usize::MAX),
+                len: (u32::MAX as usize).saturating_add(1),
             });
         }
 
@@ -277,19 +282,8 @@ impl<R: Runtime> Segmentation<R> {
     where
         Ids: MIter<R, Item = MIndex>,
     {
-        Self::from_segment_ids_host(exec, ids, segment_count)
-    }
-
-    fn from_segment_ids_host<Ids>(
-        exec: &Executor<R>,
-        ids: Ids,
-        segment_count: MIndex,
-    ) -> Result<Self, Error>
-    where
-        Ids: MIter<R, Item = MIndex>,
-    {
         let offset_count = checked_offset_count(segment_count)?;
-        let ids = crate::api::iter::materialize_exact_u32(exec, ids)?;
+        let ids = crate::api::materialize::exact(exec, ids)?;
         let value_count = ids.len();
 
         if value_count != 0 {
@@ -298,7 +292,7 @@ impl<R: Runtime> Segmentation<R> {
             unsafe {
                 validate_segment_ids_kernel::launch_unchecked::<R>(
                     exec.client(),
-                    crate::launch::cube_count_1d(
+                    crate::core::launch::cube_count_1d(
                         (value_count as usize).div_ceil(BLOCK_SIZE as usize),
                     )?,
                     CubeDim::new_1d(BLOCK_SIZE),
@@ -359,7 +353,7 @@ impl<R: Runtime> Segmentation<R> {
             unsafe {
                 lengths_from_offsets_kernel::launch_unchecked::<R>(
                     exec.client(),
-                    crate::launch::cube_count_1d(
+                    crate::core::launch::cube_count_1d(
                         (segment_count as usize).div_ceil(BLOCK_SIZE as usize),
                     )?,
                     CubeDim::new_1d(BLOCK_SIZE),
@@ -391,7 +385,7 @@ impl<R: Runtime> Segmentation<R> {
             unsafe {
                 mark_zero_based_heads_kernel::launch_unchecked::<R>(
                     exec.client(),
-                    crate::launch::cube_count_1d(
+                    crate::core::launch::cube_count_1d(
                         (segment_count as usize).div_ceil(BLOCK_SIZE as usize),
                     )?,
                     CubeDim::new_1d(BLOCK_SIZE),

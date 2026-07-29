@@ -24,17 +24,17 @@ fn bench_select(c: &mut Criterion) {
             let flags = exec.to_device(&common::flags(len, rate));
             group.bench_function(BenchmarkId::new(format!("copy_where_{rate}"), len), |b| {
                 b.iter(|| {
-                    criterion::black_box(
-                        copy_where(&exec, input.slice(..), common::as_stencil(flags.slice(..)))
-                            .unwrap(),
+                    common::completed(
+                        &exec,
+                        copy_where(&exec, input.slice(..), flags.slice(..)).unwrap(),
                     );
                 })
             });
             group.bench_function(BenchmarkId::new(format!("remove_where_{rate}"), len), |b| {
                 b.iter(|| {
-                    criterion::black_box(
-                        remove_where(&exec, input.slice(..), common::as_stencil(flags.slice(..)))
-                            .unwrap(),
+                    common::completed(
+                        &exec,
+                        remove_where(&exec, input.slice(..), flags.slice(..)).unwrap(),
                     );
                 })
             });
@@ -56,7 +56,8 @@ fn bench_select(c: &mut Criterion) {
         let flags = exec.to_device(&common::flags(len, 50));
         group.bench_function(BenchmarkId::new("copy_where_zip7", len), |b| {
             b.iter(|| {
-                criterion::black_box(
+                common::completed(
+                    &exec,
                     copy_where(
                         &exec,
                         zip7(
@@ -68,7 +69,7 @@ fn bench_select(c: &mut Criterion) {
                             columns[5].slice(..),
                             columns[6].slice(..),
                         ),
-                        common::as_stencil(flags.slice(..)),
+                        flags.slice(..),
                     )
                     .unwrap(),
                 );

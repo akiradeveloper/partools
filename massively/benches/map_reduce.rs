@@ -64,7 +64,7 @@ fn bench_map_reduce(c: &mut Criterion) {
         column_group.bench_function(BenchmarkId::new("gpu", len), |b| {
             b.iter(|| {
                 let input = lazy::map(values.slice(..), MulTwo);
-                black_box(reduce(&exec, input, init.clone(), Sum).unwrap())
+                black_box(reduce(&exec, input, init, Sum).unwrap())
             })
         });
     }
@@ -82,7 +82,7 @@ fn bench_map_reduce(c: &mut Criterion) {
                     zip2(black_box(left.slice(..)), black_box(right.slice(..))),
                     AddPair,
                 );
-                black_box(reduce(&exec, input, init.clone(), Sum).unwrap())
+                black_box(reduce(&exec, input, init, Sum).unwrap())
             })
         });
     }
@@ -105,7 +105,7 @@ fn bench_map_reduce(c: &mut Criterion) {
                     ),
                     AddTriple,
                 );
-                black_box(reduce(&exec, input, init.clone(), Sum).unwrap())
+                black_box(reduce(&exec, input, init, Sum).unwrap())
             })
         });
     }

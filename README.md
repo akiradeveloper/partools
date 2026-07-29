@@ -32,8 +32,8 @@ The algorithms are organized into two complementary families:
 - segment algorithms that apply map, scan, reduction, ordering, and selection
   independently to offset-delimited regions
 
-Memory movement is explicit, outputs are preallocated, and user-defined
-operations are compiled into GPU kernels. Lazy maps, permutations, reversed
+Memory movement is explicit, vector algorithms return owned device storage,
+and user-defined operations are compiled into GPU kernels. Lazy maps, permutations, reversed
 views, repetitions, tiling, and adjacent differences can be consumed without
 first materializing an intermediate buffer.
 
@@ -118,17 +118,6 @@ fn main() -> Result<(), massively::Error> {
     Ok(())
 }
 ```
-
-## Core Completeness Artifact
-
-The [Massively Core Lean artifact](verification/proof/) treats a conventional
-finite-control priority-CRCW PRAM as an external expressiveness benchmark and
-Massively Core as a separate bulk-synchronous target machine. Lean checks the
-instruction-machine normalization, compilation to pull/map/proposal
-compaction/deterministic reduction/controlled scatter, and preservation of
-every finite execution. The artifact records the precise current model, its
-symbolic schedule costs, and the Rust/CubeCL refinement work that is not yet
-part of this theorem.
 
 ## Core Model
 
@@ -238,9 +227,8 @@ lazy::adjacent_difference(input, op)    = lazy neighboring computation
 
 Input and output items support up to twelve columns. Keys passed to by-key
 algorithms are limited to three columns; their value items retain the full
-twelve-column limit. Output iterators are always created before an algorithm
-runs. An operation that intentionally changes a row schema expresses that
-conversion explicitly with `map`.
+twelve-column limit. An operation that intentionally changes a row schema
+expresses that conversion explicitly with `map`.
 
 ### Segmentations
 
@@ -347,10 +335,16 @@ algorithms.
 
 ## Further Reading
 
+The [0.97 release validation](RELEASE_0.97.md) records the architecture changes,
+Lampshade comparison, and remaining performance gaps. The
+[API performance table](PERFORMANCE.md) covers the dedicated vector benchmarks.
+
 ### Correctness Examples
 
 Every public algorithm has a runnable, single-column example in the
 [API documentation](https://docs.rs/massively). Integration tests are grouped
-under `massively/tests/vector` and `massively/tests/seg`. Their oracle tests
-compare public functions against CPU AoS references and cover the full map
-input/output arity matrix.
+under `massively/tests/vector` and `massively/tests/seg`. The independent,
+non-publishable [`oracle`](oracle/) crate contains CPU AoS references and
+property tests that compare public functions against those references, including
+the full map input/output arity matrix and boundary sizes. Run `just test` for
+all tests, or `just test-oracle` for the oracle tests alone.

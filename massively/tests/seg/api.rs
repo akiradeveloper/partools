@@ -184,15 +184,18 @@ impl BinaryPredicateOp<Segment<u32>> for LexicographicalBytes {
         let cursor = RuntimeCell::<u32>::new(0u32);
         let ordering = RuntimeCell::<u32>::new(0u32);
 
-        while cursor.read() < common_len && ordering.read() == 0u32 {
+        while cursor.read() < common_len {
             let lhs_item = lhs.at(cursor.read());
             let rhs_item = rhs.at(cursor.read());
             if lhs_item < rhs_item {
                 ordering.store(1u32);
+                cursor.store(common_len);
             } else if rhs_item < lhs_item {
                 ordering.store(2u32);
+                cursor.store(common_len);
+            } else {
+                cursor.store(cursor.read() + 1u32);
             }
-            cursor.store(cursor.read() + 1u32);
         }
 
         massively::flag::from_bool(if ordering.read() == 1u32 {
@@ -232,15 +235,18 @@ impl BinaryPredicateOp<Segment<Code>> for LexicographicalCodes {
         let cursor = RuntimeCell::<u32>::new(0u32);
         let ordering = RuntimeCell::<u32>::new(0u32);
 
-        while cursor.read() < common_len && ordering.read() == 0u32 {
+        while cursor.read() < common_len {
             let lhs_item = lhs.at(cursor.read()).value;
             let rhs_item = rhs.at(cursor.read()).value;
             if lhs_item < rhs_item {
                 ordering.store(1u32);
+                cursor.store(common_len);
             } else if rhs_item < lhs_item {
                 ordering.store(2u32);
+                cursor.store(common_len);
+            } else {
+                cursor.store(cursor.read() + 1u32);
             }
-            cursor.store(cursor.read() + 1u32);
         }
 
         massively::flag::from_bool(if ordering.read() == 1u32 {
@@ -263,11 +269,13 @@ impl BinaryPredicateOp<Segment<u32>> for SlicesEqual {
         } else {
             let cursor = RuntimeCell::<u32>::new(0u32);
             let equal = RuntimeCell::<u32>::new(1u32);
-            while cursor.read() < lhs.len() && equal.read() != 0u32 {
+            while cursor.read() < lhs.len() {
                 if lhs.at(cursor.read()) != rhs.at(cursor.read()) {
                     equal.store(0u32);
+                    cursor.store(lhs.len());
+                } else {
+                    cursor.store(cursor.read() + 1u32);
                 }
-                cursor.store(cursor.read() + 1u32);
             }
             equal.read() != 0u32
         })
@@ -417,6 +425,76 @@ fn segmentation_representations_are_interchangeable() {
         exec.to_host(&from_lazy_lengths.offsets()).unwrap(),
         vec![0, 2, 4, 6]
     );
+}
+
+#[test]
+fn segmentation_uses_selected_offsets_length() {
+    let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
+    let offsets = exec.to_device(&[0_u32, 1, 3, 6, 99, 99]);
+    let flags = exec.to_device(&[1_u32, 1, 1, 1, 0, 0]);
+    let selected = copy_where(&exec, offsets.slice(..), flags.slice(..)).unwrap();
+    let segmentation = Segmentation::from_offsets(&exec, selected.slice(..)).unwrap();
+
+    assert_eq!(segmentation.segment_count(), 3);
+    assert_eq!(segmentation.value_count(), 6);
+    assert_eq!(
+        exec.to_host(&segmentation.offsets()).unwrap(),
+        vec![0, 1, 3, 6]
+    );
+}
+
+#[test]
+fn segmentation_uses_selected_lengths_length() {
+    let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
+    let lengths = exec.to_device(&[1_u32, 2, 3, 99, 99]);
+    let flags = exec.to_device(&[1_u32, 1, 1, 0, 0]);
+    let selected = copy_where(&exec, lengths.slice(..), flags.slice(..)).unwrap();
+    let segmentation = Segmentation::from_lengths(&exec, selected.slice(..)).unwrap();
+
+    assert_eq!(segmentation.segment_count(), 3);
+    assert_eq!(segmentation.value_count(), 6);
+    assert_eq!(
+        exec.to_host(&segmentation.offsets()).unwrap(),
+        vec![0, 1, 3, 6]
+    );
+}
+
+#[test]
+fn segmentation_uses_selected_ids_length() {
+    let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
+    let ids = exec.to_device(&[0_u32, 1, 1, 2, 2, 2, 99, 99]);
+    let flags = exec.to_device(&[1_u32, 1, 1, 1, 1, 1, 0, 0]);
+    let selected = copy_where(&exec, ids.slice(..), flags.slice(..)).unwrap();
+    let segmentation = Segmentation::from_segment_ids(&exec, selected.slice(..), 4).unwrap();
+
+    assert_eq!(segmentation.segment_count(), 4);
+    assert_eq!(segmentation.value_count(), 6);
+    assert_eq!(
+        exec.to_host(&segmentation.offsets()).unwrap(),
+        vec![0, 1, 3, 6, 6]
+    );
+}
+
+#[test]
+fn segmentation_handles_empty_selected_representations() {
+    let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
+    let input = exec.to_device(&[99_u32, 99, 99]);
+    let flags = exec.to_device(&[0_u32, 0, 0]);
+    let selected = copy_where(&exec, input.slice(..), flags.slice(..)).unwrap();
+
+    assert!(matches!(
+        Segmentation::from_offsets(&exec, selected.slice(..)),
+        Err(massively::Error::InvalidSegmentation)
+    ));
+    let lengths = Segmentation::from_lengths(&exec, selected.slice(..)).unwrap();
+    assert_eq!(lengths.segment_count(), 0);
+    assert_eq!(lengths.value_count(), 0);
+    assert_eq!(exec.to_host(&lengths.offsets()).unwrap(), vec![0]);
+
+    let ids = Segmentation::from_segment_ids(&exec, selected.slice(..), 3).unwrap();
+    assert_eq!(ids.segment_count(), 3);
+    assert_eq!(ids.value_count(), 0);
+    assert_eq!(exec.to_host(&ids.offsets()).unwrap(), vec![0, 0, 0, 0]);
 }
 
 #[test]

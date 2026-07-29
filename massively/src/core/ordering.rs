@@ -4,56 +4,26 @@ use core::marker::PhantomData;
 
 use cubecl::prelude::*;
 
-use crate::{
-    A13, DeviceVec, Dispatch, Error, Executor, MFlag, MIndex, MStorageElement, MVec,
-    ReadExpression,
-    arg_reduce::{ArgReduceDispatch, ArgReductionOp, arg_reduce},
-    eval::Eval13,
-    launch::cube_count_1d,
-    op::IndexedBinaryOp,
-    read::{
-        AdjacentIndexedTransform, Env0, Env13, KernelReadSlots, LowerReadExpression,
-        PaddedReadSlots,
-    },
-    reduce::{ReduceDispatch, ReductionOp, StageRead, StagedBindings, reduce},
+use crate::core::arg_reduce::{ArgReduceDispatch, ArgReductionOp, arg_reduce};
+use crate::core::arity::{A13, Dispatch};
+use crate::core::bindings::Bindings;
+use crate::core::eval::Eval13;
+use crate::core::launch::cube_count_1d;
+use crate::core::op::{BinaryPredicateOp, ReductionOp};
+use crate::core::read::{
+    AdjacentIndexedTransform, Env0, Env13, KernelReadSlots, LowerReadExpression, PaddedReadSlots,
+    ReadExpression, StageRead,
 };
-
-pub(crate) mod sort;
+use crate::core::reduce::{ReduceDispatch, reduce};
+use crate::core::value::MStorageElement;
+use crate::op::IndexedBinaryOp;
+use crate::{DeviceVec, Error, Executor, MIndex, MVec};
 
 const BLOCK_SIZE: u32 = 256;
 const SORT_BLOCK_ITEMS: usize = 256;
 const SORT_BLOCK_SIZE: u32 = SORT_BLOCK_ITEMS as u32;
 const SORT_MERGE_SIZE: usize = 64;
 const SORT_MERGE_ITEMS: usize = 64;
-
-/// Compile-time binary predicate over two semantic items.
-///
-/// # Examples
-///
-/// ```
-/// use cubecl::prelude::*;
-/// use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
-/// use massively::{Executor, op, vector::sort};
-///
-/// struct Less;
-///
-/// #[cubecl::cube]
-/// impl op::BinaryPredicateOp<u32> for Less {
-///     fn apply(lhs: u32, rhs: u32) -> massively::MFlag {
-///         massively::flag::from_bool(lhs < rhs)
-///     }
-/// }
-///
-/// let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
-/// let input = exec.to_device(&[3_u32, 1, 2]);
-/// let output = sort(&exec, input.slice(..), Less).unwrap();
-///
-/// assert_eq!(exec.to_host(&output).unwrap(), vec![1, 2, 3]);
-/// ```
-#[cubecl::cube]
-pub trait BinaryPredicateOp<Item: CubeType>: 'static + Send + Sync {
-    fn apply(lhs: Item, rhs: Item) -> MFlag;
-}
 
 #[cubecl::cube]
 pub(crate) fn binary_predicate<Item, Op>(lhs: Item, rhs: Item) -> bool
@@ -81,7 +51,7 @@ where
     Less: BinaryPredicateOp<Item>,
 {
     fn rhs_wins(lhs: Item, rhs: Item) -> bool {
-        crate::ordering::binary_predicate::<Item, Less>(rhs, lhs)
+        crate::core::ordering::binary_predicate::<Item, Less>(rhs, lhs)
     }
 }
 
@@ -92,7 +62,7 @@ where
     Less: BinaryPredicateOp<Item>,
 {
     fn rhs_wins(lhs: Item, rhs: Item) -> bool {
-        !crate::ordering::binary_predicate::<Item, Less>(lhs, rhs)
+        !crate::core::ordering::binary_predicate::<Item, Less>(lhs, rhs)
     }
 }
 
@@ -103,7 +73,7 @@ where
     Less: BinaryPredicateOp<Item>,
 {
     fn rhs_wins(lhs: Item, rhs: Item) -> bool {
-        crate::ordering::binary_predicate::<Item, Less>(lhs, rhs)
+        crate::core::ordering::binary_predicate::<Item, Less>(lhs, rhs)
     }
 }
 
@@ -127,7 +97,9 @@ where
     type Output = u32;
 
     fn apply(previous: Item, current: Item, index: u32) -> u32 {
-        if index != 0u32 && crate::ordering::binary_predicate::<Item, Equal>(previous, current) {
+        if index != 0u32
+            && crate::core::ordering::binary_predicate::<Item, Equal>(previous, current)
+        {
             index - 1u32
         } else {
             4_294_967_295u32
@@ -146,7 +118,8 @@ where
     type Output = u32;
 
     fn apply(previous: Item, current: Item, index: u32) -> u32 {
-        if index != 0u32 && crate::ordering::binary_predicate::<Item, Less>(current, previous) {
+        if index != 0u32 && crate::core::ordering::binary_predicate::<Item, Less>(current, previous)
+        {
             index
         } else {
             4_294_967_295u32
@@ -167,7 +140,7 @@ where
     }
 
     fn apply(previous: Item, current: Item) -> u32 {
-        if crate::ordering::binary_predicate::<Item, Equal>(previous, current) {
+        if crate::core::ordering::binary_predicate::<Item, Equal>(previous, current) {
             0u32
         } else {
             1u32
@@ -188,7 +161,7 @@ where
     }
 
     fn apply(previous: Item, current: Item) -> u32 {
-        if crate::ordering::binary_predicate::<Item, Less>(current, previous) {
+        if crate::core::ordering::binary_predicate::<Item, Less>(current, previous) {
             1u32
         } else {
             0u32
@@ -201,7 +174,7 @@ macro_rules! define_adjacent_flags_kernel {
         #[cubecl::cube(launch_unchecked, explicit_define)]
         fn $name<
             Item: CubeType + Send + Sync + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             Expr: $eval<Item, $( $leaf ),+>,
             Op: AdjacentFlagOp<Item>,
         >(
@@ -253,7 +226,7 @@ where
 macro_rules! impl_adjacent_flags_dispatch {
     ($arity:ty,$eval:ident,$kernel:ident; [$( $leaf:ident:$index:literal ),+],$env:ty) => {
         impl<R, Input, Item, Op, $( $leaf ),+>
-            AdjacentFlagDispatch<R, Input, Item, $env, Op> for Dispatch<$arity, crate::S1>
+            AdjacentFlagDispatch<R, Input, Item, $env, Op> for Dispatch<$arity, crate::core::storage::S1>
         where
             R: Runtime,
             Item: CubeType + Send + Sync + 'static,
@@ -271,7 +244,7 @@ macro_rules! impl_adjacent_flags_dispatch {
                 input: &Input,
                 order: Option<&DeviceVec<R, u32>>,
             ) -> Result<DeviceVec<R, u32>, Error> {
-                let input_capacity = input.logical_len()?;
+                let input_capacity = input.physical_len()?;
                 let input_extent = input.logical_extent()?;
                 let (capacity, extent) = if let Some(order) = order {
                     let order_extent = order.logical_extent();
@@ -285,9 +258,7 @@ macro_rules! impl_adjacent_flags_dispatch {
                 if capacity == 0 {
                     return Ok(flags);
                 }
-                let mut reads = StagedBindings::new();
-                input.stage_at(exec.client(), exec.id(), &mut reads)?;
-                reads.pad_to_thirteen(exec.client());
+                let reads = Bindings::read(exec, input)?;
                 let offsets = exec.client().create_from_slice(u32::as_bytes(&reads.offsets));
                 let len_handle = extent.materialize(exec)?;
                 let use_order = exec
@@ -327,7 +298,7 @@ macro_rules! define_block_sort_permutation_kernel {
         #[cubecl::cube(launch_unchecked, explicit_define)]
         fn $name<
             Item: CubeType + Send + Sync + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             Expr: $eval<Item, $( $leaf ),+>,
             Less: BinaryPredicateOp<Item>,
         >(
@@ -396,7 +367,7 @@ macro_rules! define_block_sort_permutation_kernel {
                             } else {
                                 indices_b[right_start + right_rank - 1usize]
                             };
-                            if !crate::ordering::binary_predicate::<Item, Less>(
+                            if !crate::core::ordering::binary_predicate::<Item, Less>(
                                 Expr::$method($( $slot, )+ offsets, right_index as usize),
                                 Expr::$method($( $slot, )+ offsets, left_index as usize),
                             ) {
@@ -418,7 +389,7 @@ macro_rules! define_block_sort_permutation_kernel {
                                 left_index
                             } else {
                                 let right_index = indices_a[right_start + right_rank];
-                                if !crate::ordering::binary_predicate::<Item, Less>(
+                                if !crate::core::ordering::binary_predicate::<Item, Less>(
                                     Expr::$method($( $slot, )+ offsets, right_index as usize),
                                     Expr::$method($( $slot, )+ offsets, left_index as usize),
                                 ) {
@@ -436,7 +407,7 @@ macro_rules! define_block_sort_permutation_kernel {
                             left_index
                         } else {
                             let right_index = indices_b[right_start + right_rank];
-                            if !crate::ordering::binary_predicate::<Item, Less>(
+                            if !crate::core::ordering::binary_predicate::<Item, Less>(
                                 Expr::$method($( $slot, )+ offsets, right_index as usize),
                                 Expr::$method($( $slot, )+ offsets, left_index as usize),
                             ) {
@@ -478,7 +449,7 @@ macro_rules! define_merge_permutation_kernel {
         #[cubecl::cube(launch_unchecked, explicit_define)]
         fn $name<
             Item: CubeType + Send + Sync + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             Expr: $eval<Item, $( $leaf ),+>,
             Less: BinaryPredicateOp<Item>,
         >(
@@ -501,7 +472,7 @@ macro_rules! define_merge_permutation_kernel {
                 run_width * 2usize
             };
             let merge_tile_items = SORT_MERGE_SIZE * SORT_MERGE_ITEMS;
-            let tiles_per_pair = (pair_width + merge_tile_items - 1usize) / merge_tile_items;
+            let tiles_per_pair = pair_width.div_ceil(merge_tile_items);
             let pair = (CUBE_POS as usize) / tiles_per_pair;
             let tile = (CUBE_POS as usize) % tiles_per_pair;
             let base = pair * pair_width;
@@ -527,7 +498,7 @@ macro_rules! define_merge_permutation_kernel {
                     let mut partition = Shared::<[u32]>::new_slice(5usize);
                     if UNIT_POS == 0u32 {
                         let pair_ordered = right_len == 0usize
-                            || !crate::ordering::binary_predicate::<Item, Less>(
+                            || !crate::core::ordering::binary_predicate::<Item, Less>(
                                 Expr::$method(
                                     $( $slot, )+
                                     offsets,
@@ -559,7 +530,7 @@ macro_rules! define_merge_permutation_kernel {
                                 if left_rank < left_len && right_rank > 0usize {
                                     let left_index = input[base + left_rank];
                                     let right_index = input[right_start + right_rank - 1usize];
-                                    if !crate::ordering::binary_predicate::<Item, Less>(
+                                    if !crate::core::ordering::binary_predicate::<Item, Less>(
                                         Expr::$method($( $slot, )+ offsets, right_index as usize),
                                         Expr::$method($( $slot, )+ offsets, left_index as usize),
                                     ) {
@@ -579,7 +550,7 @@ macro_rules! define_merge_permutation_kernel {
                     }
                     if UNIT_POS == 1u32 {
                         let pair_ordered = right_len == 0usize
-                            || !crate::ordering::binary_predicate::<Item, Less>(
+                            || !crate::core::ordering::binary_predicate::<Item, Less>(
                                 Expr::$method(
                                     $( $slot, )+
                                     offsets,
@@ -610,7 +581,7 @@ macro_rules! define_merge_permutation_kernel {
                                 if left_rank < left_len && right_rank > 0usize {
                                     let left_index = input[base + left_rank];
                                     let right_index = input[right_start + right_rank - 1usize];
-                                    if !crate::ordering::binary_predicate::<Item, Less>(
+                                    if !crate::core::ordering::binary_predicate::<Item, Less>(
                                         Expr::$method($( $slot, )+ offsets, right_index as usize),
                                         Expr::$method($( $slot, )+ offsets, left_index as usize),
                                     ) {
@@ -684,7 +655,7 @@ macro_rules! define_merge_permutation_kernel {
                                     let left_index = shared_indices[left_rank];
                                     let right_index =
                                         shared_indices[left_count + right_rank - 1usize];
-                                    if !crate::ordering::binary_predicate::<Item, Less>(
+                                    if !crate::core::ordering::binary_predicate::<Item, Less>(
                                         Expr::$method($( $slot, )+ offsets, right_index as usize),
                                         Expr::$method($( $slot, )+ offsets, left_index as usize),
                                     ) {
@@ -711,7 +682,7 @@ macro_rules! define_merge_permutation_kernel {
                                     } else {
                                         let right_index =
                                             shared_indices[left_count + right_rank.read()];
-                                        if !crate::ordering::binary_predicate::<Item, Less>(
+                                        if !crate::core::ordering::binary_predicate::<Item, Less>(
                                             Expr::$method(
                                                 $( $slot, )+
                                                 offsets,
@@ -757,7 +728,7 @@ where
 macro_rules! impl_sort_control_dispatch {
     ($arity:ty,$eval:ident,$kernel:ident; [$( $leaf:ident:$index:literal ),+],$env:ty) => {
         impl<R, Input, Item, Less, $( $leaf ),+>
-            SortControlDispatch<R, Input, Item, $env, Less> for Dispatch<$arity, crate::S1>
+            SortControlDispatch<R, Input, Item, $env, Less> for Dispatch<$arity, crate::core::storage::S1>
         where
             R: Runtime,
             Item: CubeType + Send + Sync + 'static,
@@ -771,7 +742,7 @@ macro_rules! impl_sort_control_dispatch {
             Input::DeviceExpr: $eval<Item, $( $leaf ),+>,
         {
             fn run(exec: &Executor<R>, input: &Input) -> Result<DeviceVec<R, u32>, Error> {
-                let capacity = input.logical_len()?;
+                let capacity = input.physical_len()?;
                 let extent = input.logical_extent()?;
                 let mut current = exec.alloc_row::<u32>(capacity);
                 current.set_logical_extent(extent.clone());
@@ -779,9 +750,7 @@ macro_rules! impl_sort_control_dispatch {
                     return Ok(current);
                 }
                 let len_handle = extent.materialize(exec)?;
-                let mut reads = StagedBindings::new();
-                input.stage_at(exec.client(), exec.id(), &mut reads)?;
-                reads.pad_to_thirteen(exec.client());
+                let reads = Bindings::read(exec, input)?;
                 let offsets = exec.client().create_from_slice(u32::as_bytes(&reads.offsets));
                 unsafe {
                     block_sort_permutation_a13::launch_unchecked::<
@@ -850,11 +819,11 @@ where
     R: Runtime,
     Input: ReadExpression + LowerReadExpression + StageRead<R, Env0>,
     Less: BinaryPredicateOp<Input::Item>,
-    Dispatch<A13, crate::S1>:
+    Dispatch<A13, crate::core::storage::S1>:
         SortControlDispatch<R, Input, Input::Item, KernelReadSlots<Input::Slots>, Less>,
 {
     fn sort_control(self, exec: &Executor<R>) -> Result<DeviceVec<R, u32>, Error> {
-        <Dispatch<A13, crate::S1> as SortControlDispatch<
+        <Dispatch<A13, crate::core::storage::S1> as SortControlDispatch<
             R,
             Input,
             Input::Item,
@@ -902,11 +871,11 @@ where
     R: Runtime,
     Input: ReadExpression + LowerReadExpression + StageRead<R, Env0>,
     Op: AdjacentFlagOp<Input::Item>,
-    Dispatch<A13, crate::S1>:
+    Dispatch<A13, crate::core::storage::S1>:
         AdjacentFlagDispatch<R, Input, Input::Item, KernelReadSlots<Input::Slots>, Op>,
 {
     fn adjacent_flags(self, exec: &Executor<R>) -> Result<DeviceVec<R, u32>, Error> {
-        <Dispatch<A13, crate::S1> as AdjacentFlagDispatch<
+        <Dispatch<A13, crate::core::storage::S1> as AdjacentFlagDispatch<
             R,
             Input,
             Input::Item,
@@ -920,7 +889,7 @@ where
         exec: &Executor<R>,
         order: &DeviceVec<R, u32>,
     ) -> Result<DeviceVec<R, u32>, Error> {
-        <Dispatch<A13, crate::S1> as AdjacentFlagDispatch<
+        <Dispatch<A13, crate::core::storage::S1> as AdjacentFlagDispatch<
             R,
             Input,
             Input::Item,
@@ -965,12 +934,12 @@ where
     Equal: BinaryPredicateOp<Input::Item>,
     AdjacentIndexedTransform<Input, FirstAdjacentMatch<Equal>>:
         ReadExpression<Item = u32> + LowerReadExpression + StageRead<R, Env0>,
-    Dispatch<crate::A13, crate::S12>: ReduceDispatch<
+    Dispatch<crate::core::arity::A13, crate::core::storage::S12>: ReduceDispatch<
             R,
             AdjacentIndexedTransform<Input, FirstAdjacentMatch<Equal>>,
             u32,
             MinU32,
-            crate::read::KernelReadSlots<
+            crate::core::read::KernelReadSlots<
                 <AdjacentIndexedTransform<Input, FirstAdjacentMatch<Equal>> as LowerReadExpression>::Slots,
             >,
             Storage = DeviceVec<R, u32>,
@@ -1011,12 +980,12 @@ where
     Input: ReadExpression
         + Clone
         + AdjacentFlagInput<R, UniqueHead<Equal>>
-        + crate::selection::CopySelected<R, Output>,
+        + crate::core::selection::CopySelected<R, Output>,
     Equal: BinaryPredicateOp<Input::Item>,
 {
     fn unique_into(self, exec: &Executor<R>, output: Output) -> Result<DeviceVec<R, u32>, Error> {
         let flags = unique_head_flags::<R, _, Equal>(exec, self.clone())?;
-        let control = crate::selection::SelectionControl::from_flags(exec, flags)?;
+        let control = crate::core::selection::SelectionControl::from_flags(exec, flags)?;
         self.copy_selected(exec, &control, output)
     }
 }
@@ -1049,12 +1018,12 @@ where
     Less: BinaryPredicateOp<Input::Item>,
     AdjacentIndexedTransform<Input, FirstSortedBreak<Less>>:
         ReadExpression<Item = u32> + LowerReadExpression + StageRead<R, Env0>,
-    Dispatch<crate::A13, crate::S12>: ReduceDispatch<
+    Dispatch<crate::core::arity::A13, crate::core::storage::S12>: ReduceDispatch<
             R,
             AdjacentIndexedTransform<Input, FirstSortedBreak<Less>>,
             u32,
             MinU32,
-            crate::read::KernelReadSlots<
+            crate::core::read::KernelReadSlots<
                 <AdjacentIndexedTransform<Input, FirstSortedBreak<Less>> as LowerReadExpression>::Slots,
             >,
             Storage = DeviceVec<R, u32>,
@@ -1109,9 +1078,22 @@ where
     R: Runtime,
     Input: ReadExpression + LowerReadExpression + StageRead<R, Env0> + Clone,
     Less: BinaryPredicateOp<Input::Item>,
-    Dispatch<crate::A13, crate::S1>: ArgReduceDispatch<R, Input, ArgMinFirst<Less>, crate::read::KernelReadSlots<Input::Slots>>
-        + ArgReduceDispatch<R, Input, ArgMinLast<Less>, crate::read::KernelReadSlots<Input::Slots>>
-        + ArgReduceDispatch<R, Input, ArgMaxFirst<Less>, crate::read::KernelReadSlots<Input::Slots>>,
+    Dispatch<crate::core::arity::A13, crate::core::storage::S1>: ArgReduceDispatch<
+            R,
+            Input,
+            ArgMinFirst<Less>,
+            crate::core::read::KernelReadSlots<Input::Slots>,
+        > + ArgReduceDispatch<
+            R,
+            Input,
+            ArgMinLast<Less>,
+            crate::core::read::KernelReadSlots<Input::Slots>,
+        > + ArgReduceDispatch<
+            R,
+            Input,
+            ArgMaxFirst<Less>,
+            crate::core::read::KernelReadSlots<Input::Slots>,
+        >,
 {
     fn first_minimum(&self, exec: &Executor<R>) -> Result<DeviceVec<R, u32>, Error> {
         arg_reduce(exec, self.clone(), ArgMinFirst::<Less>(PhantomData))
@@ -1170,9 +1152,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        Counting, Permute, RowStorage, Zip, allocation::NormalizeOwnedInput, api::iter::SortAbi,
-    };
+    use crate::MFlag;
+    use crate::core::allocation::RowStorage;
+    use crate::core::iter::Zip;
+    use crate::core::read::{Counting, Permute};
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
     type Seven = (u32, u32, u32, u32, u32, u32, u32);
@@ -1212,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn sorted_queries_dispatch_eval8_with_flat_rows() {
+    fn sorted_queries_use_padded_fixed_evaluator_with_flat_rows() {
         let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
         let first = exec.to_device(&[1_u32, 1, 2, 2]);
         let second = exec.to_device(&[0_u32, 1, 0, 1]);
@@ -1276,7 +1259,108 @@ mod tests {
     }
 
     #[test]
-    fn sort_normalizes_eval8_into_storage7() {
+    fn generated_sort_control_stages_fit_the_binding_budget() {
+        type ScalarExpr = <crate::core::read::Column<u32> as LowerReadExpression>::DeviceExpr;
+        type Block = block_sort_permutation_a13::BlockSortPermutationA13<
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            ScalarExpr,
+            LessU32,
+            WgpuRuntime,
+        >;
+        type Merge = merge_permutation_a13::MergePermutationA13<
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            ScalarExpr,
+            LessU32,
+            WgpuRuntime,
+        >;
+
+        let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
+        let settings = KernelSettings::new(
+            CubeDim::new_1d(SORT_BLOCK_SIZE).into(),
+            ExecutionMode::Unchecked,
+            AddressType::U32,
+        );
+        let mut launcher = KernelLauncher::<WgpuRuntime>::new(settings.clone());
+        let handle = exec.client().empty(core::mem::size_of::<u32>());
+        let arg = unsafe {
+            <[u32] as LaunchArg>::register(BufferArg::from_raw_parts(handle, 1), &mut launcher)
+        };
+
+        let block = Block::new(
+            settings.clone(),
+            exec.client().clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+        );
+        crate::core::launch::assert_binding_budget("block sort control", &block);
+
+        let merge = Merge::new(
+            settings,
+            exec.client().clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg.clone(),
+            arg,
+        );
+        crate::core::launch::assert_binding_budget("merge sort control", &merge);
+    }
+
+    #[test]
+    fn sort_control_then_gather_orders_eight_read_slots_into_storage7() {
         let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
         let len = 513usize;
         let keys: Vec<u32> = (0..len).map(|index| (index as u32 * 37) % 23).collect();
@@ -1306,8 +1390,10 @@ mod tests {
             ),
         );
         let input = Permute::new(seven, Counting::new(0, len));
-        let temporary = input.normalize_owned(&exec).unwrap();
-        let output = Seven::sort_storage::<LexicographicLess>(&exec, temporary).unwrap();
+        let ordering = sort_control_with(&exec, input.clone(), LexicographicLess).unwrap();
+        let output = exec.alloc_row::<Seven>(len);
+        crate::core::indexed::gather_direct(&exec, input, ordering.column(), output.write())
+            .unwrap();
 
         let (keys, rows, payload2, _, _, _, payload6) = crate::MStorage::into_columns(output);
         let sorted_keys = exec.to_host(&keys).unwrap();
@@ -1327,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_find_and_unique_cover_eval8_control_and_storage7_apply() {
+    fn adjacent_find_and_unique_separate_eight_slot_control_from_storage7_apply() {
         let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
         let values = exec.to_device(&[1_u32, 1, 2, 2, 3]);
         let copies: Vec<_> = (0..6)

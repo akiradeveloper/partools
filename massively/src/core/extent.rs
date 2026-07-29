@@ -66,11 +66,7 @@ fn clamp_extent_kernel(source: &[u32], parameters: &[u32], output: &mut [u32]) {
         let start = parameters[0];
         let limit = parameters[1];
         let source_len = source[0];
-        let remaining = if source_len > start {
-            source_len - start
-        } else {
-            0u32
-        };
+        let remaining = source_len.saturating_sub(start);
         output[0] = u32::min(remaining, limit);
     }
 }

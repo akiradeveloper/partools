@@ -2,7 +2,9 @@
 
 use cubecl::prelude::Runtime;
 
-use crate::{Error, Executor, ReadExpression, indexed::IndexedCopyInput, read::Env0};
+use crate::core::indexed::IndexedCopyInput;
+use crate::core::read::{Env0, ReadExpression};
+use crate::{Error, Executor};
 
 /// Writes each input item to the output position given by its index.
 pub(crate) fn scatter<R, Values, Indices, Output>(
@@ -28,13 +30,13 @@ pub(crate) fn scatter_where<R, Values, Indices, Stencil, Output>(
 ) -> Result<(), Error>
 where
     R: Runtime,
-    Values: IndexedCopyInput<R, Indices, Output> + crate::reduce::StageRead<R, Env0>,
-    Indices: ReadExpression<Item = crate::MIndex> + crate::reduce::StageRead<R, Env0>,
-    Stencil: crate::selection::FlagInput<R>,
-    Output: crate::output::OutputExpression,
+    Values: IndexedCopyInput<R, Indices, Output> + crate::core::read::StageRead<R, Env0>,
+    Indices: ReadExpression<Item = crate::MIndex> + crate::core::read::StageRead<R, Env0>,
+    Stencil: crate::core::selection::FlagInput<R>,
+    Output: crate::core::output::OutputExpression,
 {
-    let values_len = values.logical_len()?;
-    let indices_len = indices.logical_len()?;
+    let values_len = values.physical_len()?;
+    let indices_len = indices.physical_len()?;
     let stencil_len = stencil.flag_len()?;
     if values_len != indices_len {
         return Err(Error::LengthMismatch {
@@ -56,7 +58,10 @@ where
     values.indexed_copy_selected(
         exec,
         indices,
-        Some(control.indices()),
+        Some(crate::core::indexed::IndexSelection::Routing {
+            control: &control,
+            retain_output_position: false,
+        }),
         Some(control.count()),
         false,
         output,
@@ -66,7 +71,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Counting, Permute, Zip};
+    use crate::core::iter::Zip;
+    use crate::core::read::{Counting, Permute};
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
     #[test]

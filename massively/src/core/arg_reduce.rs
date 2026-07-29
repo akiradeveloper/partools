@@ -2,13 +2,15 @@
 
 use cubecl::prelude::*;
 
-use crate::{
-    A13, DeviceVec, Dispatch, Error, Executor, MStorageElement, ReadExpression,
-    eval::Eval13,
-    launch::cube_count_1d,
-    read::{Env0, Env13, KernelReadSlots, LowerReadExpression, PaddedReadSlots},
-    reduce::{StageRead, StagedBindings},
+use crate::core::arity::{A13, Dispatch};
+use crate::core::bindings::Bindings;
+use crate::core::eval::Eval13;
+use crate::core::launch::cube_count_1d;
+use crate::core::read::{
+    Env0, Env13, KernelReadSlots, LowerReadExpression, PaddedReadSlots, ReadExpression, StageRead,
 };
+use crate::core::value::MStorageElement;
+use crate::{DeviceVec, Error, Executor};
 
 const BLOCK_SIZE: u32 = 256;
 const ITEMS_PER_UNIT: usize = 256;
@@ -29,7 +31,7 @@ macro_rules! define_arg_reduce_kernel {
         #[cubecl::cube(launch_unchecked, explicit_define)]
         fn $name<
             Item: CubeType + Send + Sync + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             Expr: $eval<Item, $( $leaf ),+>,
             Op: ArgReductionOp<Item>,
         >(
@@ -41,12 +43,16 @@ macro_rules! define_arg_reduce_kernel {
             let unit = UNIT_POS as usize;
             let cube_dim = BLOCK_SIZE as usize;
             let logical_len = len[0] as usize;
+            if CUBE_POS as usize >= crate::core::launch::logical_block_count(logical_len, TILE_SIZE) {
+                if UNIT_POS == 0u32 && (CUBE_POS as usize) < partials.len() {
+                    partials[CUBE_POS as usize] = u32::MAX;
+                }
+                terminate!();
+            }
             let tile_start = CUBE_POS as usize * TILE_SIZE;
             let first_index = tile_start + unit;
             let safe_index = if first_index < logical_len {
                 first_index
-            } else if logical_len == 0usize {
-                0usize
             } else {
                 logical_len - 1usize
             };
@@ -55,7 +61,7 @@ macro_rules! define_arg_reduce_kernel {
                 if first_index < logical_len { 1u32 } else { 0u32 },
             );
 
-            if tile_start + TILE_SIZE <= logical_len {
+            if logical_len - tile_start >= TILE_SIZE {
                 for item in 1usize..ITEMS_PER_UNIT {
                     let rhs_index = first_index + item * cube_dim;
                     let lhs_index = accumulator.read() as usize;
@@ -123,7 +129,7 @@ macro_rules! define_arg_reduce_kernel {
             sync_cube();
 
             if PLANE_POS == 0u32 {
-                let plane_count = (CUBE_DIM + PLANE_DIM - 1u32) / PLANE_DIM;
+                let plane_count = CUBE_DIM.div_ceil(PLANE_DIM);
                 let source = if UNIT_POS_PLANE < plane_count {
                     UNIT_POS_PLANE as usize
                 } else {
@@ -201,7 +207,7 @@ macro_rules! define_arg_partial_kernel {
         #[cubecl::cube(launch_unchecked, explicit_define)]
         fn $name<
             Item: CubeType + Send + Sync + 'static,
-            $( $leaf: CubePrimitive, )+
+            $( $leaf: CubePrimitive + cubecl::frontend::Scalar, )+
             Expr: $eval<Item, $( $leaf ),+>,
             Op: ArgReductionOp<Item>,
         >(
@@ -214,12 +220,16 @@ macro_rules! define_arg_partial_kernel {
             let unit = UNIT_POS as usize;
             let cube_dim = BLOCK_SIZE as usize;
             let logical_len = len[0] as usize;
+            if CUBE_POS as usize >= crate::core::launch::logical_block_count(logical_len, TILE_SIZE) {
+                if UNIT_POS == 0u32 && (CUBE_POS as usize) < partials.len() {
+                    partials[CUBE_POS as usize] = u32::MAX;
+                }
+                terminate!();
+            }
             let tile_start = CUBE_POS as usize * TILE_SIZE;
             let first_position = tile_start + unit;
             let safe_position = if first_position < logical_len {
                 first_position
-            } else if logical_len == 0usize {
-                0usize
             } else {
                 logical_len - 1usize
             };
@@ -286,7 +296,7 @@ macro_rules! define_arg_partial_kernel {
             sync_cube();
 
             if PLANE_POS == 0u32 {
-                let plane_count = (CUBE_DIM + PLANE_DIM - 1u32) / PLANE_DIM;
+                let plane_count = CUBE_DIM.div_ceil(PLANE_DIM);
                 let source = if UNIT_POS_PLANE < plane_count {
                     UNIT_POS_PLANE as usize
                 } else {
@@ -376,7 +386,7 @@ fn block_count(len: usize) -> usize {
 macro_rules! impl_arg_reduce_dispatch {
     ($arity:ty,$eval:ident,$first:ident,$partial:ident,$env:ty; [$( $leaf:ident:$index:literal ),+]) => {
         impl<R, Input, Item, Op, $( $leaf ),+> ArgReduceDispatch<R, Input, Op, $env>
-            for Dispatch<$arity, crate::S1>
+            for Dispatch<$arity, crate::core::storage::S1>
         where
             R: Runtime,
             Item: CubeType + Send + Sync + 'static,
@@ -390,15 +400,13 @@ macro_rules! impl_arg_reduce_dispatch {
             Input::DeviceExpr: $eval<Item, $( $leaf ),+>,
         {
             fn execute(exec: &Executor<R>, input: &Input) -> Result<DeviceVec<R, u32>, Error> {
-                let capacity = input.logical_len()?;
+                let capacity = input.physical_len()?;
                 if capacity == 0 {
                     return Ok(exec.to_device(&[u32::MAX]));
                 }
                 let extent = input.logical_extent()?;
                 let client = exec.client();
-                let mut bindings = StagedBindings::new();
-                input.stage_at(client, exec.id(), &mut bindings)?;
-                bindings.pad_to_thirteen(client);
+                let bindings = Bindings::read(exec, input)?;
                 let offsets = client.create_from_slice(u32::as_bytes(&bindings.offsets));
                 let len_handle = extent.materialize(exec)?;
                 let blocks = block_count(capacity);
@@ -459,9 +467,10 @@ where
     R: Runtime,
     Input: ReadExpression + LowerReadExpression + StageRead<R, Env0>,
     Op: ArgReductionOp<Input::Item>,
-    Dispatch<A13, crate::S1>: ArgReduceDispatch<R, Input, Op, KernelReadSlots<Input::Slots>>,
+    Dispatch<A13, crate::core::storage::S1>:
+        ArgReduceDispatch<R, Input, Op, KernelReadSlots<Input::Slots>>,
 {
-    <Dispatch<A13, crate::S1> as ArgReduceDispatch<
+    <Dispatch<A13, crate::core::storage::S1> as ArgReduceDispatch<
         R,
         Input,
         Op,

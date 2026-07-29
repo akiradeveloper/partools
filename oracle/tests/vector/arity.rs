@@ -607,9 +607,10 @@ transform_where_arity_row!(7;
 proptest! {
     #![proptest_config(ProptestConfig { cases: CASES, .. ProptestConfig::default() })]
 
-    /// Seven value leaves plus the permutation index consume all eight read slots.
+    /// Seven value leaves plus the permutation index consume eight physical slots
+    /// before the consumer pads them to the fixed ABI.
     #[test]
-    fn lazify_dispatches_through_eval8(
+    fn lazify_preserves_eight_physical_slots_before_fixed_padding(
         seed in oracle_vec(0_u32..100),
     ) {
         let exec = exec();

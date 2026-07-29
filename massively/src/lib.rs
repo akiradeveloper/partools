@@ -55,26 +55,8 @@ pub mod flag;
 pub mod seg;
 pub mod vector;
 
-// Compatibility aliases keep the kernel core independent from the public
-// module layout.
-pub(crate) use core::allocation::{RowAlloc, RowStorage};
-pub(crate) use core::arity::{A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13};
-pub(crate) use core::iter::Zip;
 #[doc(hidden)]
 pub use core::read::Value as ValueRead;
-pub(crate) use core::read::{
-    Column, Constant, Counting, DivModCounting, Permute, ReadExpression, ReverseCounting, Stride,
-    Taken, Transform,
-};
-pub(crate) use core::reduce::Dispatch;
-pub(crate) use core::runtime::ColumnMut;
-pub(crate) use core::storage::{S1, S2, S3, S4, S5, S6, S7, S8, S9, S10, S11, S12, StorageLayout};
-pub(crate) use core::value::MStorageElement;
-pub(crate) use core::{
-    allocation, arg_reduce, arity, eval, expansion, extent, indexed, launch, merge, ordering,
-    output, predicate, radix, read, reduce, scan, search, segmented, selection, storage, transform,
-    value,
-};
 
 /// Index and logical-length value used by Massively device APIs.
 ///

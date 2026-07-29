@@ -5,15 +5,19 @@
 
 #![allow(private_interfaces)]
 
+use crate::core::{extent, read};
+
 use core::marker::PhantomData;
 use std::ops::RangeBounds;
 
 use cubecl::prelude::Runtime;
 
-use crate::{
-    Error, MIndex, MIter, MStorageElement, api::iter::MIterExtent, op::ReductionOp, op::UnaryOp,
-};
-use crate::{core::facade as private, read::SliceExpression};
+use crate::api::iter::MIterExtent;
+use crate::core::facade as private;
+use crate::core::read::SliceExpression;
+use crate::core::value::MStorageElement;
+use crate::op::{ReductionOp, UnaryOp};
+use crate::{Error, MIndex, MIter};
 
 pub use crate::core::read::Taken;
 
@@ -104,7 +108,7 @@ where
         self.contexts.capacity()
     }
 
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
+    fn logical_extent(&self) -> Result<extent::LogicalExtent, Error> {
         self.contexts.logical_extent()
     }
 }
@@ -128,26 +132,26 @@ where
     R: Runtime,
     Values: MIter<R>,
     Indices: MIter<R, Item = MIndex>,
-    crate::read::Permute<Values::Read, Indices::Read>:
+    read::Permute<Values::Read, Indices::Read>:
         private::KernelInput<R, Item = Values::Item> + SliceExpression,
 {
     type Item = Values::Item;
-    type Read = crate::read::Permute<Values::Read, Indices::Read>;
-    type Slice = crate::read::Slice<R, Self::Read>;
+    type Read = read::Permute<Values::Read, Indices::Read>;
+    type Slice = read::Slice<R, Self::Read>;
 
     fn slice<Bounds>(&self, range: Bounds) -> Self::Slice
     where
         Bounds: RangeBounds<MIndex>,
     {
         let input = self.clone().lower_read();
-        let len = private::logical_len::<R, _>(&input)
+        let len = private::physical_len::<R, _>(&input)
             .expect("cannot slice a lazy permutation with an invalid length");
-        let (start, count) = crate::read::resolve_mindex_slice_range(len, range);
-        crate::read::Slice::new(input.slice_expression(start, count))
+        let (start, count) = read::resolve_mindex_slice_range(len, range);
+        read::Slice::new(input.slice_expression(start, count))
     }
 
     fn lower_read(self) -> Self::Read {
-        crate::read::Permute::new(self.values.lower_read(), self.indices.lower_read())
+        read::Permute::new(self.values.lower_read(), self.indices.lower_read())
     }
 }
 
@@ -160,7 +164,7 @@ where
         self.indices.capacity()
     }
 
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
+    fn logical_extent(&self) -> Result<extent::LogicalExtent, Error> {
         self.indices.logical_extent()
     }
 }
@@ -182,26 +186,25 @@ impl<R, Values> MIter<R> for Reverse<Values>
 where
     R: Runtime,
     Values: MIter<R>,
-    crate::read::Reverse<Values::Read>:
-        private::KernelInput<R, Item = Values::Item> + SliceExpression,
+    read::Reverse<Values::Read>: private::KernelInput<R, Item = Values::Item> + SliceExpression,
 {
     type Item = Values::Item;
-    type Read = crate::read::Reverse<Values::Read>;
-    type Slice = crate::read::Slice<R, Self::Read>;
+    type Read = read::Reverse<Values::Read>;
+    type Slice = read::Slice<R, Self::Read>;
 
     fn slice<Bounds>(&self, range: Bounds) -> Self::Slice
     where
         Bounds: RangeBounds<MIndex>,
     {
         let input = self.clone().lower_read();
-        let len = private::logical_len::<R, _>(&input)
+        let len = private::physical_len::<R, _>(&input)
             .expect("cannot slice a lazy reverse view with an invalid length");
-        let (start, count) = crate::read::resolve_mindex_slice_range(len, range);
-        crate::read::Slice::new(input.slice_expression(start, count))
+        let (start, count) = read::resolve_mindex_slice_range(len, range);
+        read::Slice::new(input.slice_expression(start, count))
     }
 
     fn lower_read(self) -> Self::Read {
-        crate::read::Reverse::new(self.values.lower_read())
+        read::Reverse::new(self.values.lower_read())
     }
 }
 
@@ -214,7 +217,7 @@ where
         self.values.capacity()
     }
 
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
+    fn logical_extent(&self) -> Result<extent::LogicalExtent, Error> {
         self.values.logical_extent()
     }
 }
@@ -260,22 +263,22 @@ impl<R, Values> MIter<R> for RepeatEach<Values>
 where
     R: Runtime,
     Values: MIter<R>,
-    crate::read::Permute<Values::Read, crate::read::DivModCounting>:
+    read::Permute<Values::Read, read::DivModCounting>:
         private::KernelInput<R, Item = Values::Item> + SliceExpression,
 {
     type Item = Values::Item;
-    type Read = crate::read::Permute<Values::Read, crate::read::DivModCounting>;
-    type Slice = crate::read::Slice<R, Self::Read>;
+    type Read = read::Permute<Values::Read, read::DivModCounting>;
+    type Slice = read::Slice<R, Self::Read>;
 
     fn slice<Bounds>(&self, range: Bounds) -> Self::Slice
     where
         Bounds: RangeBounds<MIndex>,
     {
         let input = self.clone().lower_read();
-        let len = private::logical_len::<R, _>(&input)
+        let len = private::physical_len::<R, _>(&input)
             .expect("cannot slice lazy repeat_each with an invalid length");
-        let (start, count) = crate::read::resolve_mindex_slice_range(len, range);
-        crate::read::Slice::new(input.slice_expression(start, count))
+        let (start, count) = read::resolve_mindex_slice_range(len, range);
+        read::Slice::new(input.slice_expression(start, count))
     }
 
     fn lower_read(self) -> Self::Read {
@@ -285,13 +288,13 @@ where
             .expect("lazy repeat_each input must have a valid capacity");
         let output_len =
             repeated_len(input_len, self.repeats).expect("lazy repeat_each length overflow");
-        let indices = crate::read::DivModCounting::new(
+        let indices = read::DivModCounting::new(
             0,
             self.repeats.max(1),
             input_len.max(1),
             output_len as usize,
         );
-        crate::read::Permute::new(self.values.lower_read(), indices)
+        read::Permute::new(self.values.lower_read(), indices)
     }
 }
 
@@ -304,8 +307,8 @@ where
         self.output_len::<R>()
     }
 
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        Ok(crate::extent::LogicalExtent::fixed(
+    fn logical_extent(&self) -> Result<extent::LogicalExtent, Error> {
+        Ok(extent::LogicalExtent::fixed(
             self.output_len::<R>()? as usize
         ))
     }
@@ -352,22 +355,22 @@ impl<R, Values> MIter<R> for Tile<Values>
 where
     R: Runtime,
     Values: MIter<R>,
-    crate::read::Permute<Values::Read, crate::read::DivModCounting>:
+    read::Permute<Values::Read, read::DivModCounting>:
         private::KernelInput<R, Item = Values::Item> + SliceExpression,
 {
     type Item = Values::Item;
-    type Read = crate::read::Permute<Values::Read, crate::read::DivModCounting>;
-    type Slice = crate::read::Slice<R, Self::Read>;
+    type Read = read::Permute<Values::Read, read::DivModCounting>;
+    type Slice = read::Slice<R, Self::Read>;
 
     fn slice<Bounds>(&self, range: Bounds) -> Self::Slice
     where
         Bounds: RangeBounds<MIndex>,
     {
         let input = self.clone().lower_read();
-        let len = private::logical_len::<R, _>(&input)
+        let len = private::physical_len::<R, _>(&input)
             .expect("cannot slice lazy tile with an invalid length");
-        let (start, count) = crate::read::resolve_mindex_slice_range(len, range);
-        crate::read::Slice::new(input.slice_expression(start, count))
+        let (start, count) = read::resolve_mindex_slice_range(len, range);
+        read::Slice::new(input.slice_expression(start, count))
     }
 
     fn lower_read(self) -> Self::Read {
@@ -376,8 +379,8 @@ where
             .capacity()
             .expect("lazy tile input must have a valid capacity");
         let output_len = repeated_len(input_len, self.repeats).expect("lazy tile length overflow");
-        let indices = crate::read::DivModCounting::new(0, 1, input_len.max(1), output_len as usize);
-        crate::read::Permute::new(self.values.lower_read(), indices)
+        let indices = read::DivModCounting::new(0, 1, input_len.max(1), output_len as usize);
+        read::Permute::new(self.values.lower_read(), indices)
     }
 }
 
@@ -390,8 +393,8 @@ where
         self.output_len::<R>()
     }
 
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
-        Ok(crate::extent::LogicalExtent::fixed(
+    fn logical_extent(&self) -> Result<extent::LogicalExtent, Error> {
+        Ok(extent::LogicalExtent::fixed(
             self.output_len::<R>()? as usize
         ))
     }
@@ -447,22 +450,22 @@ where
     R: Runtime,
     Input: MIter<R>,
     Op: ReductionOp<Input::Item>,
-    crate::read::Permute<crate::read::Adjacent<Input::Read, Op>, crate::read::Counting>:
+    read::Permute<read::Adjacent<Input::Read, Op>, read::Counting>:
         private::KernelInput<R, Item = Input::Item> + SliceExpression,
 {
     type Item = Input::Item;
-    type Read = crate::read::Permute<crate::read::Adjacent<Input::Read, Op>, crate::read::Counting>;
-    type Slice = crate::read::Slice<R, Self::Read>;
+    type Read = read::Permute<read::Adjacent<Input::Read, Op>, read::Counting>;
+    type Slice = read::Slice<R, Self::Read>;
 
     fn slice<Bounds>(&self, range: Bounds) -> Self::Slice
     where
         Bounds: RangeBounds<MIndex>,
     {
         let input = self.clone().lower_read();
-        let len = private::logical_len::<R, _>(&input)
+        let len = private::physical_len::<R, _>(&input)
             .expect("cannot slice lazy adjacent_difference with an invalid length");
-        let (start, count) = crate::read::resolve_mindex_slice_range(len, range);
-        crate::read::Slice::new(input.slice_expression(start, count))
+        let (start, count) = read::resolve_mindex_slice_range(len, range);
+        read::Slice::new(input.slice_expression(start, count))
     }
 
     fn lower_read(self) -> Self::Read {
@@ -470,9 +473,9 @@ where
             .input
             .capacity()
             .expect("lazy adjacent_difference input must have a valid capacity");
-        crate::read::Permute::new(
-            crate::read::Adjacent::from_input(self.input.lower_read()),
-            crate::read::Counting::new(0, len as usize),
+        read::Permute::new(
+            read::Adjacent::from_input(self.input.lower_read()),
+            read::Counting::new(0, len as usize),
         )
     }
 }
@@ -486,7 +489,7 @@ where
         self.input.capacity()
     }
 
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
+    fn logical_extent(&self) -> Result<extent::LogicalExtent, Error> {
         self.input.logical_extent()
     }
 }
@@ -524,26 +527,25 @@ where
     R: Runtime,
     Input: MIter<R>,
     Op: UnaryOp<Input::Item>,
-    crate::read::Transform<Input::Read, Op>:
-        private::KernelInput<R, Item = Op::Output> + SliceExpression,
+    read::Transform<Input::Read, Op>: private::KernelInput<R, Item = Op::Output> + SliceExpression,
 {
     type Item = Op::Output;
-    type Read = crate::read::Transform<Input::Read, Op>;
-    type Slice = crate::read::Slice<R, Self::Read>;
+    type Read = read::Transform<Input::Read, Op>;
+    type Slice = read::Slice<R, Self::Read>;
 
     fn slice<Bounds>(&self, range: Bounds) -> Self::Slice
     where
         Bounds: RangeBounds<MIndex>,
     {
         let input = self.clone().lower_read();
-        let len = private::logical_len::<R, _>(&input)
+        let len = private::physical_len::<R, _>(&input)
             .expect("cannot slice a lazy map with an invalid length");
-        let (start, count) = crate::read::resolve_mindex_slice_range(len, range);
-        crate::read::Slice::new(input.slice_expression(start, count))
+        let (start, count) = read::resolve_mindex_slice_range(len, range);
+        read::Slice::new(input.slice_expression(start, count))
     }
 
     fn lower_read(self) -> Self::Read {
-        crate::read::Transform::from_input(self.input.lower_read())
+        read::Transform::from_input(self.input.lower_read())
     }
 }
 
@@ -556,7 +558,7 @@ where
         self.input.capacity()
     }
 
-    fn logical_extent(&self) -> Result<crate::extent::LogicalExtent, Error> {
+    fn logical_extent(&self) -> Result<extent::LogicalExtent, Error> {
         self.input.logical_extent()
     }
 }
@@ -601,23 +603,23 @@ impl Stride {
     }
 }
 
-impl<T> crate::read::TakenSource for Constant<T>
+impl<T> read::TakenSource for Constant<T>
 where
     T: MStorageElement,
 {
-    type Read = crate::read::Constant<T>;
+    type Read = read::Constant<T>;
 
     fn lower(&self, _offset: usize, len: usize) -> Self::Read {
-        crate::read::Constant::new(self.value, len)
+        read::Constant::new(self.value, len)
     }
 }
 
-impl crate::read::TakenSource for Counting {
-    type Read = crate::read::Counting;
+impl read::TakenSource for Counting {
+    type Read = read::Counting;
 
     fn lower(&self, offset: usize, len: usize) -> Self::Read {
         let offset = u32::try_from(offset).expect("counting offset exceeds u32");
-        crate::read::Counting::new(
+        read::Counting::new(
             self.start
                 .checked_add(offset)
                 .expect("counting start overflow"),
@@ -626,12 +628,12 @@ impl crate::read::TakenSource for Counting {
     }
 }
 
-impl crate::read::TakenSource for Stride {
-    type Read = crate::read::Stride;
+impl read::TakenSource for Stride {
+    type Read = read::Stride;
 
     fn lower(&self, offset: usize, len: usize) -> Self::Read {
         let offset = u32::try_from(offset).expect("stride offset exceeds u32");
-        crate::read::Stride::new(
+        read::Stride::new(
             self.start
                 .checked_add(
                     offset

@@ -1,8 +1,7 @@
 use cubecl::prelude::*;
 
-use crate::{
-    DeviceVec, Error, Executor, MIndex, MIter, MIterMut, op::BinaryPredicateOp, op::ReductionOp,
-};
+use crate::op::{BinaryPredicateOp, ReductionOp};
+use crate::{DeviceVec, Error, Executor, MIndex, MIter, MIterMut};
 
 const BLOCK_SIZE: u32 = 256;
 
@@ -179,7 +178,7 @@ impl<R: Runtime> SegmentOffsets<R> {
     where
         Offsets: MIter<R, Item = MIndex>,
     {
-        let offsets = crate::api::iter::materialize_u32(exec, offsets)?;
+        let offsets = crate::api::materialize::exact(exec, offsets)?;
         Self::from_materialized(offsets, value_len)
     }
 
@@ -265,7 +264,7 @@ impl<R: Runtime> SegmentControl<R> {
             unsafe {
                 mark_segment_heads_kernel::launch_unchecked::<R>(
                     exec.client(),
-                    crate::launch::cube_count_1d(
+                    crate::core::launch::cube_count_1d(
                         (segment_count as usize).div_ceil(BLOCK_SIZE as usize),
                     )?,
                     CubeDim::new_1d(BLOCK_SIZE),
@@ -313,7 +312,7 @@ impl<R: Runtime> SegmentControl<R> {
         unsafe {
             reverse_indices_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (self.value_len as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -345,7 +344,7 @@ impl<R: Runtime> SegmentControl<R> {
         unsafe {
             merge_head_flags_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (self.value_len as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -376,7 +375,7 @@ impl<R: Runtime> SegmentControl<R> {
         unsafe {
             clear_head_flags_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (self.value_len as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -404,7 +403,7 @@ impl<R: Runtime> SegmentControl<R> {
         unsafe {
             take_flags_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (self.value_len as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -440,7 +439,7 @@ impl<R: Runtime> SegmentControl<R> {
         unsafe {
             match_candidates_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (self.value_len as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -475,7 +474,7 @@ impl<R: Runtime> SegmentControl<R> {
         unsafe {
             sorted_until_candidates_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (self.value_len as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -512,7 +511,7 @@ impl<R: Runtime> SegmentControl<R> {
         unsafe {
             finish_sorted_until_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (self.segment_count as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -584,7 +583,7 @@ where
         unsafe {
             selected_offsets_kernel::launch_unchecked::<R>(
                 exec.client(),
-                crate::launch::cube_count_1d(
+                crate::core::launch::cube_count_1d(
                     (offset_count as usize).div_ceil(BLOCK_SIZE as usize),
                 )?,
                 CubeDim::new_1d(BLOCK_SIZE),
@@ -606,11 +605,12 @@ where
         output_offsets,
     )?;
 
-    let selection = crate::selection::SelectionControl::from_positions(exec, positions)?;
+    let selection = crate::core::selection::SelectionControl::from_positions(exec, positions)?;
+    let selected_indices = selection.materialize_indices(exec)?;
     crate::vector::apply_permutation_prefix_into(
         exec,
         input,
-        selection.indices().column(),
+        selected_indices.column(),
         selection.count(),
         output,
     )?;

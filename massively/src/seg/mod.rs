@@ -19,15 +19,9 @@ pub use segmentation::Segmentation;
 use cubecl::prelude::*;
 use std::{marker::PhantomData, ops::RangeBounds};
 
-use crate::{
-    Error, Executor, MAlloc, MFlag, MIndex, MIter, MIterMut, MStorage, MVec,
-    api::iter::{MIterExtent, MStorageExtent},
-    op::BinaryPredicateOp,
-    op::ExpandOp,
-    op::PredicateOp,
-    op::ReductionOp,
-    op::UnaryOp,
-};
+use crate::api::iter::{MIterExtent, MStorageExtent};
+use crate::op::{BinaryPredicateOp, ExpandOp, PredicateOp, ReductionOp, UnaryOp};
+use crate::{Error, Executor, MAlloc, MFlag, MIndex, MIter, MIterMut, MStorage, MVec};
 
 pub(crate) fn segment_count(offset_count: usize) -> Result<usize, Error> {
     offset_count
@@ -102,21 +96,21 @@ where
     Values: MIter<R>,
     Offsets: MIter<R, Item = MIndex>,
     SegmentRead<Values::Read, Offsets::Read>: crate::core::facade::KernelInput<R, Item = Segment<Values::Item>>
-        + crate::read::SliceExpression,
+        + crate::core::read::SliceExpression,
 {
     type Item = Segment<Values::Item>;
     type Read = SegmentRead<Values::Read, Offsets::Read>;
-    type Slice = crate::read::Slice<R, Self::Read>;
+    type Slice = crate::core::read::Slice<R, Self::Read>;
 
     fn slice<Bounds>(&self, range: Bounds) -> Self::Slice
     where
         Bounds: RangeBounds<MIndex>,
     {
         let input = self.clone().lower_read();
-        let len = crate::core::facade::logical_len::<R, _>(&input)
+        let len = crate::core::facade::physical_len::<R, _>(&input)
             .expect("cannot slice segmented input with an invalid length");
-        let (start, count) = crate::read::resolve_mindex_slice_range(len, range);
-        crate::read::Slice::new(crate::read::SliceExpression::slice_expression(
+        let (start, count) = crate::core::read::resolve_mindex_slice_range(len, range);
+        crate::core::read::Slice::new(crate::core::read::SliceExpression::slice_expression(
             &input, start, count,
         ))
     }
@@ -133,7 +127,7 @@ where
     Offsets: MIter<R, Item = MIndex>,
 {
     fn capacity(&self) -> Result<crate::MIndex, Error> {
-        crate::api::iter::logical_len(segment_count(self.offsets.capacity()? as usize)?)
+        crate::api::iter::checked_len(segment_count(self.offsets.capacity()? as usize)?)
     }
 }
 
@@ -399,7 +393,7 @@ where
         let ids = control.ids(exec)?;
 
         let values = crate::api::iter::lower_fixed::<R, _>(values);
-        let ordering = crate::ordering::sort_control_with(exec, values.clone(), less)?;
+        let ordering = crate::core::ordering::sort_control_with(exec, values.clone(), less)?;
         let sorted_ids = exec.alloc::<MIndex>(value_len);
         crate::api::algorithm::apply_permutation_into(
             exec,
@@ -408,7 +402,7 @@ where
             sorted_ids.slice_mut(..),
         )?;
 
-        let id_ordering = crate::ordering::sort_control_with(
+        let id_ordering = crate::core::ordering::sort_control_with(
             exec,
             crate::api::iter::lower_fixed::<R, _>(sorted_ids.slice(..)),
             control::LessU32,
@@ -475,12 +469,12 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
         let values = crate::api::iter::lower_fixed::<R, _>(self.values);
         if let Some(init) = self.init {
-            crate::segmented::segmented_exclusive::<R, _, _, Item, Op>(
+            crate::core::segmented::segmented_exclusive::<R, _, _, Item, Op>(
                 self.exec,
                 &values,
                 &self.heads,
@@ -488,7 +482,7 @@ where
                 &output,
             )
         } else {
-            crate::segmented::segmented_inclusive::<R, _, _, Item, Op>(
+            crate::core::segmented::segmented_inclusive::<R, _, _, Item, Op>(
                 self.exec,
                 &values,
                 &self.heads,
@@ -614,7 +608,7 @@ where
         let value_len = values.capacity()?;
         let control = control::SegmentControl::new(exec, offsets, value_len)?;
         let values = crate::api::iter::lower_fixed::<R, _>(values);
-        let flags = crate::ordering::unique_head_flags::<R, _, Equal>(exec, values.clone())?;
+        let flags = crate::core::ordering::unique_head_flags::<R, _, Equal>(exec, values.clone())?;
         control.merge_heads(exec, &flags)?;
         let (output_values, output_offsets) = output.into_parts();
         control.compact(exec, values, flags, output_values, output_offsets)
@@ -647,7 +641,7 @@ where
     type Output = MFlag;
 
     fn apply(input: Item) -> MFlag {
-        crate::flag::from_bool(!crate::predicate::predicate::<Item, Pred>(input))
+        crate::flag::from_bool(!crate::core::predicate::predicate::<Item, Pred>(input))
     }
 }
 
@@ -677,7 +671,7 @@ struct SegmentReduceOperation<'a, R: Runtime, Values, Item: MAlloc<R>, Op> {
     exec: &'a Executor<R>,
     values: Values,
     heads: &'a crate::DeviceVec<R, u32>,
-    head_control: &'a crate::selection::SelectionControl<R>,
+    head_control: &'a crate::core::selection::SelectionControl<R>,
     init: MVec<R, Item>,
     _op: Op,
 }
@@ -694,7 +688,7 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
         crate::core::by_key::reduce_values_by_heads_lowered(
@@ -736,10 +730,11 @@ where
         );
     }
 
-    let head_control = crate::selection::FlagInput::selected_control(
+    let head_control = crate::core::selection::FlagInput::selected_control(
         crate::api::iter::lower::<R, _>(control.heads.slice(..)),
         exec,
     )?;
+    let head_indices = head_control.materialize_indices(exec)?;
 
     let reduced = exec.alloc::<Values::Item>(segment_count);
     reduced
@@ -757,7 +752,7 @@ where
     crate::api::algorithm::apply_permutation_prefix_into(
         exec,
         crate::api::iter::lower_fixed::<R, _>(control.heads.slice(..)),
-        head_control.indices().column(),
+        head_indices.column(),
         head_control.count(),
         keys.slice_mut(..),
     )?;
@@ -1019,7 +1014,7 @@ where
         let (values, offsets) = input.into_parts();
         let value_len = values.capacity()?;
         let control = control::SegmentControl::new(exec, offsets, value_len)?;
-        let different = crate::ordering::unique_head_flags::<R, _, Equal>(
+        let different = crate::core::ordering::unique_head_flags::<R, _, Equal>(
             exec,
             crate::api::iter::lower_fixed::<R, _>(values),
         )?;
@@ -1055,7 +1050,7 @@ where
         let (values, offsets) = input.into_parts();
         let value_len = values.capacity()?;
         let control = control::SegmentControl::new(exec, offsets, value_len)?;
-        let breaks = crate::ordering::sorted_break_flags::<R, _, Less>(
+        let breaks = crate::core::ordering::sorted_break_flags::<R, _, Less>(
             exec,
             crate::api::iter::lower_fixed::<R, _>(values),
         )?;
@@ -1097,7 +1092,7 @@ where
         let (values, offsets) = input.into_parts();
         let value_len = values.capacity()?;
         let control = control::SegmentControl::new(exec, offsets, value_len)?;
-        let breaks = crate::ordering::sorted_break_flags::<R, _, Less>(
+        let breaks = crate::core::ordering::sorted_break_flags::<R, _, Less>(
             exec,
             crate::api::iter::lower_fixed::<R, _>(values),
         )?;
@@ -1271,7 +1266,7 @@ macro_rules! impl_owned_compacting {
                 )?;
                 let written = crate::api::value::read::<R, MIndex>(exec, &written)?;
                 let values =
-                    crate::api::iter::into_exact_prefix::<R, Input::Item>(exec, values, written)?;
+                    crate::api::materialize::into_exact_prefix::<R, Input::Item>(exec, values, written)?;
                 let segmentation = Segmentation::from_generated_offsets(offsets, written)?;
                 Ok(SegmentIterator::new(values, segmentation))
             }
@@ -1305,7 +1300,8 @@ where
             SegmentedMut::new(values.slice_mut(..), offsets.slice_mut(..)),
         )?;
         let written = crate::api::value::read::<R, MIndex>(exec, &written)?;
-        let values = crate::api::iter::into_exact_prefix::<R, Input::Item>(exec, values, written)?;
+        let values =
+            crate::api::materialize::into_exact_prefix::<R, Input::Item>(exec, values, written)?;
         let segmentation = Segmentation::from_generated_offsets(offsets, written)?;
         Ok(SegmentIterator::new(values, segmentation))
     }
@@ -1328,7 +1324,7 @@ where
         input: SegmentIterator<Input, InputOffsets>,
     ) -> Result<Self::Output, Error> {
         let segment_count = segment_count(input.offsets().capacity()? as usize)?;
-        let segment_count = crate::api::iter::logical_len(segment_count)?;
+        let segment_count = crate::api::iter::checked_len(segment_count)?;
         let output = exec.alloc::<Input::Item>(segment_count);
         SummarizingExecutableInto::run_into(self, exec, input, output.slice_mut(..))?;
         Ok(output)
@@ -1353,7 +1349,7 @@ macro_rules! impl_owned_summary {
                 input: SegmentIterator<Input, InputOffsets>,
             ) -> Result<Self::Output, Error> {
                 let segment_count = segment_count(input.offsets().capacity()? as usize)?;
-                let segment_count = crate::api::iter::logical_len(segment_count)?;
+                let segment_count = crate::api::iter::checked_len(segment_count)?;
                 let output = exec.alloc::<$result>(segment_count);
                 SummarizingExecutableInto::run_into(self, exec, input, output.slice_mut(..))?;
                 Ok(output)

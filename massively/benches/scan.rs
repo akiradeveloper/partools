@@ -38,9 +38,7 @@ fn bench_scan(c: &mut Criterion) {
         });
         group.bench_function(BenchmarkId::new("exclusive", len), |b| {
             b.iter(|| {
-                std::hint::black_box(
-                    exclusive_scan(&exec, values.slice(..), init.clone(), Sum).unwrap(),
-                );
+                std::hint::black_box(exclusive_scan(&exec, values.slice(..), init, Sum).unwrap());
                 exec.sync().unwrap();
             })
         });
@@ -61,7 +59,7 @@ fn bench_scan(c: &mut Criterion) {
                         keys.slice(..),
                         values.slice(..),
                         Equal,
-                        init.clone(),
+                        init,
                         Sum,
                     )
                     .unwrap(),

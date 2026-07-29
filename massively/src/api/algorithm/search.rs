@@ -1,6 +1,7 @@
 use cubecl::prelude::*;
 
-use crate::{Error, Executor, MFlag, MIndex, MIter, MVec, op::BinaryPredicateOp};
+use crate::op::BinaryPredicateOp;
+use crate::{Error, Executor, MFlag, MIndex, MIter, MVec};
 
 /// Finds the first source item equal to any needle.
 ///
@@ -42,7 +43,7 @@ where
     Needles: MIter<R, Item = Source::Item>,
     Equal: BinaryPredicateOp<Source::Item>,
 {
-    let value = crate::search::find_first_of(
+    let value = crate::core::search::find_first_of(
         exec,
         crate::api::iter::lower_fixed::<R, _>(source),
         crate::api::iter::lower_fixed::<R, _>(needles),
@@ -90,7 +91,7 @@ where
     Values: MIter<R, Item = Source::Item>,
     Less: BinaryPredicateOp<Source::Item>,
 {
-    crate::search::lower_bounds_storage(
+    crate::core::search::lower_bounds_storage(
         exec,
         crate::api::iter::lower_fixed::<R, _>(source),
         crate::api::iter::lower_fixed::<R, _>(values),
@@ -137,7 +138,7 @@ where
     Values: MIter<R, Item = Source::Item>,
     Less: BinaryPredicateOp<Source::Item>,
 {
-    crate::search::upper_bounds_storage(
+    crate::core::search::upper_bounds_storage(
         exec,
         crate::api::iter::lower_fixed::<R, _>(source),
         crate::api::iter::lower_fixed::<R, _>(values),
@@ -189,7 +190,7 @@ where
     if left_len != right_len {
         return Ok(crate::flag::from_bool(false));
     }
-    let mismatch = crate::search::equal(
+    let mismatch = crate::core::search::equal(
         exec,
         crate::api::iter::lower_fixed::<R, _>(left),
         crate::api::iter::lower_fixed::<R, _>(right),
@@ -243,7 +244,7 @@ where
     let left_len = left.capacity()?;
     let right_len = right.capacity()?;
     let shared_len = left_len.min(right_len);
-    let index = crate::search::mismatch(
+    let index = crate::core::search::mismatch(
         exec,
         crate::api::iter::lower_fixed::<R, _>(left),
         crate::api::iter::lower_fixed::<R, _>(right),
@@ -298,7 +299,7 @@ where
     Right: MIter<R, Item = Left::Item>,
     Less: BinaryPredicateOp<Left::Item>,
 {
-    let value = crate::search::lexicographical_compare(
+    let value = crate::core::search::lexicographical_compare(
         exec,
         crate::api::iter::lower_fixed::<R, _>(left),
         crate::api::iter::lower_fixed::<R, _>(right),

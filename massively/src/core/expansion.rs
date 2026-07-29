@@ -2,50 +2,62 @@
 
 use cubecl::prelude::*;
 
-use crate::{
-    DeviceVec, Error, Executor, ReadExpression, StorageLayout,
-    eval::Eval13,
-    op::ExpandOp,
-    output::{
-        LowerOutputExpression, OutputBindings, OutputExpression, PaddedOutputSlots, StageOutput,
-    },
-    read::{Env0, LowerReadExpression, PaddedReadSlots},
-    reduce::{StageRead, StagedBindings},
-    storage::{Decompose, StorePadded12, StorePadded12Expand},
+use crate::core::bindings::Bindings;
+use crate::core::eval::Eval13;
+use crate::core::output::{
+    LowerOutputExpression, OutputExpression, PaddedOutputSlots, StageOutput,
 };
+use crate::core::read::{Env0, LowerReadExpression, PaddedReadSlots, ReadExpression, StageRead};
+use crate::core::storage::{Decompose, StorageLayout, StorePadded12, StorePadded12Expand};
+use crate::op::ExpandOp;
+use crate::{DeviceVec, Error, Executor};
 
 const BLOCK_SIZE: u32 = 256;
+// Each expanded output stores `[input_index, local_index]`.
+const RESOLVED_EXPANSION_WORDS: usize = 2;
+
+/// Turns prefix offsets and owners into the canonical expansion mapping.
+#[cubecl::cube(launch_unchecked, explicit_define)]
+fn resolve_expansion(element_offsets: &[u32], owners: &[u32], resolved: &mut [u32]) {
+    let output_index = ABSOLUTE_POS as usize;
+    if output_index < owners.len() {
+        let input_index = (owners[output_index] - 1u32) as usize;
+        let base = output_index * RESOLVED_EXPANSION_WORDS;
+        resolved[base] = input_index as u32;
+        resolved[base + 1usize] = output_index as u32 - element_offsets[input_index];
+    }
+}
 
 #[cubecl::cube(launch_unchecked, explicit_define)]
 #[allow(clippy::too_many_arguments)]
 fn generate_a13<
     InputItem: CubeType + Send + Sync + 'static,
     OutputItem: CubeType + Send + Sync + 'static,
-    L0: CubePrimitive,
-    L1: CubePrimitive,
-    L2: CubePrimitive,
-    L3: CubePrimitive,
-    L4: CubePrimitive,
-    L5: CubePrimitive,
-    L6: CubePrimitive,
-    L7: CubePrimitive,
-    L8: CubePrimitive,
-    L9: CubePrimitive,
-    L10: CubePrimitive,
-    L11: CubePrimitive,
-    L12: CubePrimitive,
-    O0: CubePrimitive,
-    O1: CubePrimitive,
-    O2: CubePrimitive,
-    O3: CubePrimitive,
-    O4: CubePrimitive,
-    O5: CubePrimitive,
-    O6: CubePrimitive,
-    O7: CubePrimitive,
-    O8: CubePrimitive,
-    O9: CubePrimitive,
-    O10: CubePrimitive,
-    O11: CubePrimitive,
+    L0: CubePrimitive + cubecl::frontend::Scalar,
+    L1: CubePrimitive + cubecl::frontend::Scalar,
+    L2: CubePrimitive + cubecl::frontend::Scalar,
+    L3: CubePrimitive + cubecl::frontend::Scalar,
+    L4: CubePrimitive + cubecl::frontend::Scalar,
+    L5: CubePrimitive + cubecl::frontend::Scalar,
+    L6: CubePrimitive + cubecl::frontend::Scalar,
+    L7: CubePrimitive + cubecl::frontend::Scalar,
+    L8: CubePrimitive + cubecl::frontend::Scalar,
+    L9: CubePrimitive + cubecl::frontend::Scalar,
+    L10: CubePrimitive + cubecl::frontend::Scalar,
+    L11: CubePrimitive + cubecl::frontend::Scalar,
+    L12: CubePrimitive + cubecl::frontend::Scalar,
+    O0: CubePrimitive + cubecl::frontend::Scalar,
+    O1: CubePrimitive + cubecl::frontend::Scalar,
+    O2: CubePrimitive + cubecl::frontend::Scalar,
+    O3: CubePrimitive + cubecl::frontend::Scalar,
+    O4: CubePrimitive + cubecl::frontend::Scalar,
+    O5: CubePrimitive + cubecl::frontend::Scalar,
+    O6: CubePrimitive + cubecl::frontend::Scalar,
+    O7: CubePrimitive + cubecl::frontend::Scalar,
+    O8: CubePrimitive + cubecl::frontend::Scalar,
+    O9: CubePrimitive + cubecl::frontend::Scalar,
+    O10: CubePrimitive + cubecl::frontend::Scalar,
+    O11: CubePrimitive + cubecl::frontend::Scalar,
     Leaves: CubeType
         + Send
         + Sync
@@ -82,8 +94,7 @@ fn generate_a13<
     slot11: &[L11],
     slot12: &[L12],
     read_offsets: &[u32],
-    element_offsets: &[u32],
-    owners: &[u32],
+    resolved: &[u32],
     out0: &mut [O0],
     out1: &mut [O1],
     out2: &mut [O2],
@@ -99,9 +110,10 @@ fn generate_a13<
     write_offsets: &[u32],
 ) {
     let output_index = ABSOLUTE_POS as usize;
-    if output_index < owners.len() {
-        let input_index = (owners[output_index] - 1u32) as usize;
-        let local_index = output_index as u32 - element_offsets[input_index];
+    if output_index < resolved.len() / RESOLVED_EXPANSION_WORDS {
+        let base = output_index * RESOLVED_EXPANSION_WORDS;
+        let input_index = resolved[base] as usize;
+        let local_index = resolved[base + 1usize];
         let input = Expr::eval13(
             slot0,
             slot1,
@@ -155,7 +167,7 @@ where
     <Output::Item as StorageLayout>::StorageLeaves: StorePadded12,
     <<Output::Item as StorageLayout>::StorageLeaves as CubeType>::ExpandType: StorePadded12Expand,
 {
-    let input_len = input.logical_len()?;
+    let input_len = input.physical_len()?;
     let expected_offsets = input_len
         .checked_add(1)
         .ok_or(Error::LengthTooLarge { len: input_len })?;
@@ -166,7 +178,7 @@ where
         });
     }
 
-    let output_len = output.logical_len()?;
+    let output_len = output.physical_len()?;
     if owners.capacity() != output_len {
         return Err(Error::LengthMismatch {
             left: owners.capacity(),
@@ -177,21 +189,29 @@ where
         return Ok(());
     }
 
-    let mut reads = StagedBindings::new();
-    input.stage_at(exec.client(), exec.id(), &mut reads)?;
-    reads.pad_to_thirteen(exec.client());
-    let mut writes = OutputBindings::new();
-    output.stage_output(exec.id(), &mut writes)?;
-    writes.pad_to_twelve(exec.client());
+    let reads = Bindings::read(exec, input)?;
+    let writes = Bindings::write(exec, output)?;
     let read_offsets = exec
         .client()
         .create_from_slice(u32::as_bytes(&reads.offsets));
     let write_offsets = exec
         .client()
         .create_from_slice(u32::as_bytes(&writes.offsets));
-    let cubes = crate::launch::cube_count_1d(output_len.div_ceil(BLOCK_SIZE as usize))?;
+    let cubes = crate::core::launch::cube_count_1d(output_len.div_ceil(BLOCK_SIZE as usize))?;
+    let resolved_len = output_len
+        .checked_mul(RESOLVED_EXPANSION_WORDS)
+        .ok_or(Error::LengthTooLarge { len: output_len })?;
+    let resolved = exec.alloc_column::<u32>(resolved_len);
 
     unsafe {
+        resolve_expansion::launch_unchecked::<R>(
+            exec.client(),
+            cubes.clone(),
+            CubeDim::new_1d(BLOCK_SIZE),
+            BufferArg::from_raw_parts(element_offsets.handle.clone(), element_offsets.capacity()),
+            BufferArg::from_raw_parts(owners.handle.clone(), owners.capacity()),
+            BufferArg::from_raw_parts(resolved.handle.clone(), resolved_len),
+        );
         generate_a13::launch_unchecked::<
             Input::Item,
             Output::Item,
@@ -243,8 +263,7 @@ where
             BufferArg::from_raw_parts(reads.slots[11].0.clone(), reads.slots[11].1),
             BufferArg::from_raw_parts(reads.slots[12].0.clone(), reads.slots[12].1),
             BufferArg::from_raw_parts(read_offsets, reads.offsets.len()),
-            BufferArg::from_raw_parts(element_offsets.handle.clone(), element_offsets.capacity()),
-            BufferArg::from_raw_parts(owners.handle.clone(), owners.capacity()),
+            BufferArg::from_raw_parts(resolved.handle.clone(), resolved_len),
             BufferArg::from_raw_parts(writes.slots[0].0.clone(), writes.slots[0].1),
             BufferArg::from_raw_parts(writes.slots[1].0.clone(), writes.slots[1].1),
             BufferArg::from_raw_parts(writes.slots[2].0.clone(), writes.slots[2].1),
@@ -261,4 +280,85 @@ where
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+
+    struct Repeat;
+
+    #[cubecl::cube]
+    impl ExpandOp<u32> for Repeat {
+        type Output = u32;
+
+        fn count(input: u32) -> u32 {
+            input
+        }
+
+        fn generate(input: u32, local_index: u32) -> u32 {
+            input + local_index
+        }
+    }
+
+    #[test]
+    fn generated_expansion_apply_fits_the_binding_budget() {
+        type ScalarLeaves = <u32 as StorageLayout>::StorageLeaves;
+        type ScalarLayout = <u32 as StorageLayout>::DeviceLayout;
+        type ScalarExpr = <crate::core::read::Column<u32> as LowerReadExpression>::DeviceExpr;
+        type Kernel = generate_a13::GenerateA13<
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            ScalarLeaves,
+            ScalarExpr,
+            ScalarLayout,
+            Repeat,
+            WgpuRuntime,
+        >;
+
+        let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
+        let settings = KernelSettings::new(
+            CubeDim::new_1d(BLOCK_SIZE).into(),
+            ExecutionMode::Unchecked,
+            AddressType::U32,
+        );
+        let mut launcher = KernelLauncher::<WgpuRuntime>::new(settings.clone());
+        let handle = exec.client().empty(core::mem::size_of::<u32>());
+        let arg = unsafe {
+            <[u32] as LaunchArg>::register(BufferArg::from_raw_parts(handle, 1), &mut launcher)
+        };
+        let kernel = crate::core::launch::kernel_with_max_explicit_storage_bindings!(
+            Kernel,
+            settings,
+            exec.client().clone(),
+            arg
+        );
+        crate::core::launch::assert_binding_budget("expansion apply", &kernel);
+    }
 }

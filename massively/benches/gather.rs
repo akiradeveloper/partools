@@ -12,14 +12,7 @@ fn bench_gather(c: &mut Criterion) {
         exec.sync().unwrap();
         group.bench_function(BenchmarkId::new("reverse", len), |b| {
             b.iter(|| {
-                std::hint::black_box(
-                    gather(
-                        &exec,
-                        input.slice(..),
-                        common::as_indices(indices.slice(..)),
-                    )
-                    .unwrap(),
-                );
+                std::hint::black_box(gather(&exec, input.slice(..), indices.slice(..)).unwrap());
                 exec.sync().unwrap();
             })
         });

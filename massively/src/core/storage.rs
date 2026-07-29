@@ -293,11 +293,12 @@ impl<T> ReadElement for T where
 
 /// A scalar that may participate in a flat logical row.
 ///
-/// Unlike [`crate::MStorageElement`], this includes read-only semantic values
+/// Unlike [`crate::core::value::MStorageElement`], this includes read-only semantic values
 /// such as `bool` and `usize` that cannot own a device column.
 #[doc(hidden)]
 pub trait FlatElement:
     CubePrimitive
+    + cubecl::frontend::Scalar
     + StorageLayout<StorageArity = S1, StorageLeaves = Last<Self>>
     + Copy
     + Send
@@ -308,6 +309,7 @@ pub trait FlatElement:
 
 impl<T> FlatElement for T where
     T: CubePrimitive
+        + cubecl::frontend::Scalar
         + StorageLayout<StorageArity = S1, StorageLeaves = Last<Self>>
         + Copy
         + Send
@@ -636,12 +638,12 @@ pub trait PlaneShuffleLeaves: CubeType + Sized {
 /// Workgroup-local storage with the same heterogeneous leaf shape as a value.
 /// Each implementation allocates exactly one shared array per real leaf.
 #[derive(CubeType)]
-pub struct SharedLast<T: CubePrimitive> {
+pub struct SharedLast<T: CubePrimitive + cubecl::frontend::Scalar> {
     value: Shared<[T]>,
 }
 
 #[derive(CubeType)]
-pub struct SharedMore<Head: CubePrimitive, Tail: CubeType> {
+pub struct SharedMore<Head: CubePrimitive + cubecl::frontend::Scalar, Tail: CubeType> {
     head: Shared<[Head]>,
     tail: Tail,
 }
@@ -656,7 +658,7 @@ pub trait SharedLeaves: CubeType + Sized {
 }
 
 #[cubecl::cube]
-impl<T: CubePrimitive> SharedLeaves for Last<T> {
+impl<T: CubePrimitive + cubecl::frontend::Scalar> SharedLeaves for Last<T> {
     type Shared = SharedLast<T>;
 
     fn new_shared(#[comptime] len: usize) -> Self::Shared {
@@ -679,7 +681,7 @@ impl<T: CubePrimitive> SharedLeaves for Last<T> {
 #[cubecl::cube]
 impl<Head, Tail> SharedLeaves for More<Head, Tail>
 where
-    Head: CubePrimitive,
+    Head: CubePrimitive + cubecl::frontend::Scalar,
     Tail: SharedLeaves,
 {
     type Shared = SharedMore<Head, Tail::Shared>;
@@ -705,17 +707,17 @@ where
 }
 
 #[cubecl::cube]
-fn shuffle_primitive<T: CubePrimitive>(value: T, offset: u32) -> T {
+fn shuffle_primitive<T: CubePrimitive + cubecl::frontend::Scalar>(value: T, offset: u32) -> T {
     plane_shuffle_down(value, offset)
 }
 
 #[cubecl::cube]
-fn shuffle_primitive_up<T: CubePrimitive>(value: T, offset: u32) -> T {
+fn shuffle_primitive_up<T: CubePrimitive + cubecl::frontend::Scalar>(value: T, offset: u32) -> T {
     plane_shuffle_up(value, offset)
 }
 
 #[cubecl::cube]
-impl<T: CubePrimitive> SelectLeaves for Last<T> {
+impl<T: CubePrimitive + cubecl::frontend::Scalar> SelectLeaves for Last<T> {
     fn select(condition: bool, if_true: Self, if_false: Self) -> Self {
         Last::<T> {
             value: if condition {
@@ -728,7 +730,7 @@ impl<T: CubePrimitive> SelectLeaves for Last<T> {
 }
 
 #[cubecl::cube]
-impl<T: CubePrimitive> MutableLeaves for Last<T> {
+impl<T: CubePrimitive + cubecl::frontend::Scalar> MutableLeaves for Last<T> {
     type Cells = Last<RuntimeCell<T>>;
 
     fn into_cells(self) -> Self::Cells {
@@ -747,7 +749,7 @@ impl<T: CubePrimitive> MutableLeaves for Last<T> {
 }
 
 #[cubecl::cube]
-impl<T: CubePrimitive> PlaneShuffleLeaves for Last<T> {
+impl<T: CubePrimitive + cubecl::frontend::Scalar> PlaneShuffleLeaves for Last<T> {
     fn shuffle_leaves_down(value: Self, offset: u32) -> Self {
         Last::<T> {
             value: shuffle_primitive::<T>(value.value, offset),
@@ -764,7 +766,7 @@ impl<T: CubePrimitive> PlaneShuffleLeaves for Last<T> {
 #[cubecl::cube]
 impl<Head, Tail> SelectLeaves for More<Head, Tail>
 where
-    Head: CubePrimitive,
+    Head: CubePrimitive + cubecl::frontend::Scalar,
     Tail: SelectLeaves,
 {
     fn select(condition: bool, if_true: Self, if_false: Self) -> Self {
@@ -782,7 +784,7 @@ where
 #[cubecl::cube]
 impl<Head, Tail> MutableLeaves for More<Head, Tail>
 where
-    Head: CubePrimitive,
+    Head: CubePrimitive + cubecl::frontend::Scalar,
     Tail: MutableLeaves,
 {
     type Cells = More<RuntimeCell<Head>, Tail::Cells>;
@@ -807,7 +809,7 @@ where
 #[cubecl::cube]
 impl<Head, Tail> PlaneShuffleLeaves for More<Head, Tail>
 where
-    Head: CubePrimitive,
+    Head: CubePrimitive + cubecl::frontend::Scalar,
     Tail: PlaneShuffleLeaves,
 {
     fn shuffle_leaves_down(value: Self, offset: u32) -> Self {
@@ -886,7 +888,7 @@ macro_rules! define_store_leaves {
         #[doc(hidden)]
         #[cubecl::cube]
         #[allow(unused_mut)]
-        pub trait $trait_name<$( $leaf: CubePrimitive ),+>: CubeType {
+        pub trait $trait_name<$( $leaf: CubePrimitive + cubecl::frontend::Scalar ),+>: CubeType {
             fn store(
                 self,
                 $( $out: &mut [$leaf], )+
@@ -897,7 +899,7 @@ macro_rules! define_store_leaves {
 
         #[cubecl::cube]
         #[allow(unused_mut)]
-        impl<$( $leaf: CubePrimitive ),+> $trait_name<$( $leaf ),+> for $leaves {
+        impl<$( $leaf: CubePrimitive + cubecl::frontend::Scalar ),+> $trait_name<$( $leaf ),+> for $leaves {
             fn store(
                 self,
                 $( $out: &mut [$leaf], )+
@@ -1021,18 +1023,18 @@ define_store_leaves!(StoreLeaves12; More<L0, More<L1, More<L2, More<L3, More<L4,
 #[cubecl::cube]
 #[allow(clippy::too_many_arguments)]
 pub trait StorePadded12: CubeType {
-    type O0: crate::MStorageElement;
-    type O1: crate::MStorageElement;
-    type O2: crate::MStorageElement;
-    type O3: crate::MStorageElement;
-    type O4: crate::MStorageElement;
-    type O5: crate::MStorageElement;
-    type O6: crate::MStorageElement;
-    type O7: crate::MStorageElement;
-    type O8: crate::MStorageElement;
-    type O9: crate::MStorageElement;
-    type O10: crate::MStorageElement;
-    type O11: crate::MStorageElement;
+    type O0: crate::core::value::MStorageElement;
+    type O1: crate::core::value::MStorageElement;
+    type O2: crate::core::value::MStorageElement;
+    type O3: crate::core::value::MStorageElement;
+    type O4: crate::core::value::MStorageElement;
+    type O5: crate::core::value::MStorageElement;
+    type O6: crate::core::value::MStorageElement;
+    type O7: crate::core::value::MStorageElement;
+    type O8: crate::core::value::MStorageElement;
+    type O9: crate::core::value::MStorageElement;
+    type O10: crate::core::value::MStorageElement;
+    type O11: crate::core::value::MStorageElement;
 
     fn store_padded(
         self,
@@ -1066,7 +1068,7 @@ macro_rules! impl_store_padded12 {
         #[allow(unused_variables, clippy::too_many_arguments)]
         impl<$($active_ty),+> StorePadded12 for $leaves
         where
-            $($active_ty: crate::MStorageElement,)+
+            $($active_ty: crate::core::value::MStorageElement,)+
         {
             type O0 = $a0;
             type O1 = $a1;
@@ -1126,12 +1128,12 @@ macro_rules! define_load_leaves {
     ($trait_name:ident; $leaves:ty; $( $leaf:ident:$input:ident ),+; $offsets:ident,$index:ident; $body:expr) => {
         #[doc(hidden)]
         #[cubecl::cube]
-        pub trait $trait_name<$( $leaf: CubePrimitive ),+>: CubeType {
+        pub trait $trait_name<$( $leaf: CubePrimitive + cubecl::frontend::Scalar ),+>: CubeType {
             fn load($( $input: &[$leaf], )+ offsets: &[u32], index: usize) -> Self;
         }
 
         #[cubecl::cube]
-        impl<$( $leaf: CubePrimitive ),+> $trait_name<$( $leaf ),+> for $leaves {
+        impl<$( $leaf: CubePrimitive + cubecl::frontend::Scalar ),+> $trait_name<$( $leaf ),+> for $leaves {
             fn load($( $input: &[$leaf], )+ $offsets: &[u32], $index: usize) -> Self {
                 $body
             }
@@ -1181,12 +1183,12 @@ macro_rules! define_load_mut_leaves {
     ($trait_name:ident; $leaves:ty; $( $leaf:ident:$input:ident ),+; $offsets:ident,$index:ident; $body:expr) => {
         #[doc(hidden)]
         #[cubecl::cube]
-        pub trait $trait_name<$( $leaf: CubePrimitive ),+>: CubeType {
+        pub trait $trait_name<$( $leaf: CubePrimitive + cubecl::frontend::Scalar ),+>: CubeType {
             fn load_mut($( $input: &mut [$leaf], )+ offsets: &[u32], index: usize) -> Self;
         }
 
         #[cubecl::cube]
-        impl<$( $leaf: CubePrimitive ),+> $trait_name<$( $leaf ),+> for $leaves {
+        impl<$( $leaf: CubePrimitive + cubecl::frontend::Scalar ),+> $trait_name<$( $leaf ),+> for $leaves {
             fn load_mut($( $input: &mut [$leaf], )+ $offsets: &[u32], $index: usize) -> Self {
                 $body
             }
@@ -1269,7 +1271,7 @@ macro_rules! impl_load_padded12 {
         #[allow(unused_variables, clippy::too_many_arguments)]
         impl<$($active_ty),+> LoadPadded12 for $leaves
         where
-            $($active_ty: crate::MStorageElement,)+
+            $($active_ty: crate::core::value::MStorageElement,)+
         {
             #[allow(unused_variables)]
             fn load_padded(
@@ -1350,7 +1352,7 @@ macro_rules! impl_load_mut_padded12 {
         #[allow(unused_variables, clippy::too_many_arguments)]
         impl<$($active_ty),+> LoadMutPadded12 for $leaves
         where
-            $($active_ty: crate::MStorageElement,)+
+            $($active_ty: crate::core::value::MStorageElement,)+
         {
             #[allow(unused_variables)]
             fn load_mut_padded(

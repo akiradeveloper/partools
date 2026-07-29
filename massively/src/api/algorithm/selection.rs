@@ -1,9 +1,8 @@
 use cubecl::prelude::{CubeType, Runtime};
 
-use crate::{
-    Error, Executor, MAlloc, MFlag, MIndex, MIter, MIterMut, MStorage, MVec,
-    api::iter::MStorageExtent, op::PredicateOp, op::UnaryOp,
-};
+use crate::api::iter::MStorageExtent;
+use crate::op::{PredicateOp, UnaryOp};
+use crate::{Error, Executor, MAlloc, MFlag, MIndex, MIter, MIterMut, MStorage, MVec};
 
 struct CopyWhereOperation<'a, R: Runtime, Input, Stencil, const REMOVE: bool> {
     exec: &'a Executor<R>,
@@ -23,15 +22,15 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
         let input = crate::api::iter::lower::<R, _>(self.input);
         let stencil = crate::api::iter::lower::<R, _>(self.stencil);
         if REMOVE {
-            crate::selection::remove_where(self.exec, input, stencil, output)
+            crate::core::selection::remove_where(self.exec, input, stencil, output)
         } else {
-            crate::selection::copy_where(self.exec, input, stencil, output)
+            crate::core::selection::copy_where(self.exec, input, stencil, output)
         }
     }
 }
@@ -59,10 +58,10 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        crate::selection::replace_where(
+        crate::core::selection::replace_where(
             self.exec,
             crate::api::value::into_scratch::<R, Item>(self.value),
             crate::api::iter::lower::<R, _>(self.stencil),
@@ -83,10 +82,10 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        crate::selection::partition(
+        crate::core::selection::partition(
             self.exec,
             crate::api::iter::lower_fixed::<R, _>(self.input),
             self.pred,
@@ -115,10 +114,10 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        crate::selection::transform_where(
+        crate::core::selection::transform_where(
             self.exec,
             crate::api::iter::lower::<R, _>(self.input),
             self.op,
@@ -157,7 +156,7 @@ where
     let capacity = input.capacity()?;
     let mut output = exec.alloc::<Item>(capacity);
     let len = copy_where_into(exec, input, stencil, output.slice_mut(..))?;
-    output.set_logical_extent(crate::extent::LogicalExtent::from_device(
+    output.set_logical_extent(crate::core::extent::LogicalExtent::from_device(
         &len,
         capacity as usize,
     ));
@@ -214,7 +213,7 @@ where
     let capacity = input.capacity()?;
     let mut output = exec.alloc::<Item>(capacity);
     let len = remove_where_into(exec, input, stencil, output.slice_mut(..))?;
-    output.set_logical_extent(crate::extent::LogicalExtent::from_device(
+    output.set_logical_extent(crate::core::extent::LogicalExtent::from_device(
         &len,
         capacity as usize,
     ));
@@ -281,9 +280,11 @@ where
     Pred: PredicateOp<Item>,
 {
     let len = input.capacity()?;
-    let output = exec.alloc::<Item>(len);
+    let extent = input.logical_extent()?;
+    let mut output = exec.alloc::<Item>(len);
     let boundary = partition_into(exec, input, pred, output.slice_mut(..))?;
     let boundary = crate::api::value::read::<R, MIndex>(exec, &boundary)?;
+    output.set_logical_extent(extent);
     Ok((output, boundary))
 }
 

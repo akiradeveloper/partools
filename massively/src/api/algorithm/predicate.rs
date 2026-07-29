@@ -1,6 +1,7 @@
 use cubecl::prelude::*;
 
-use crate::{Error, Executor, MFlag, MIndex, MIter, op::PredicateOp};
+use crate::op::PredicateOp;
+use crate::{Error, Executor, MFlag, MIndex, MIter};
 
 macro_rules! predicate_api {
     (
@@ -22,7 +23,7 @@ macro_rules! predicate_api {
             Pred: PredicateOp<Input::Item>,
         {
             let len = input.capacity()?;
-            let value = crate::predicate::$core_name(
+            let value = crate::core::predicate::$core_name(
                 exec,
                 crate::api::iter::lower_fixed::<R, _>(input),
                 pred,
@@ -226,7 +227,7 @@ where
     Pred: PredicateOp<Input::Item>,
 {
     let value =
-        crate::predicate::find_if(exec, crate::api::iter::lower_fixed::<R, _>(input), pred)?;
+        crate::core::predicate::find_if(exec, crate::api::iter::lower_fixed::<R, _>(input), pred)?;
     crate::api::value::read_optional_index(exec, &value)
 }
 predicate_api!(

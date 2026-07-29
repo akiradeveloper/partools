@@ -26,7 +26,7 @@ fn bench_scatter(c: &mut Criterion) {
                 scatter(
                     &exec,
                     input.slice(..),
-                    common::as_indices(indices.slice(..)),
+                    indices.slice(..),
                     output.slice_mut(..),
                 )
                 .unwrap();
@@ -44,8 +44,8 @@ fn bench_scatter(c: &mut Criterion) {
                 scatter_reduce(
                     &exec,
                     input.slice(..),
-                    common::as_indices(collision_indices.slice(..)),
-                    init.clone(),
+                    collision_indices.slice(..),
+                    init,
                     Add,
                     output.slice_mut(..),
                 )

@@ -1,9 +1,8 @@
 use cubecl::prelude::{CubeType, Runtime};
 
-use crate::{
-    Error, Executor, MAlloc, MIter, MIterMut, MStorage, MVec, api::iter::MStorageExtent,
-    op::UnaryOp,
-};
+use crate::api::iter::MStorageExtent;
+use crate::op::UnaryOp;
+use crate::{Error, Executor, MAlloc, MIter, MIterMut, MStorage, MVec};
 
 struct TransformOperation<'a, R: Runtime, Input, Op> {
     exec: &'a Executor<R>,
@@ -24,15 +23,15 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
         let input = crate::api::iter::lower_fixed::<R, _>(self.input);
         match self.active_len {
-            Some(active_len) => crate::transform::transform_prefix_fixed(
+            Some(active_len) => crate::core::transform::transform_prefix_fixed(
                 self.exec, input, self.op, active_len, output,
             ),
-            None => crate::transform::transform_fixed(self.exec, input, self.op, output),
+            None => crate::core::transform::transform_fixed(self.exec, input, self.op, output),
         }
     }
 }
@@ -89,25 +88,6 @@ where
 /// assert_eq!(exec.to_host(&output).unwrap(), vec![2, 3, 4]);
 /// ```
 pub fn map<R, Input, Op>(
-    exec: &Executor<R>,
-    input: Input,
-    op: Op,
-) -> Result<MVec<R, Op::Output>, Error>
-where
-    R: Runtime,
-    Input: MIter<R>,
-    Op: UnaryOp<Input::Item>,
-    Op::Output: MAlloc<R>,
-{
-    let len = input.capacity()?;
-    let extent = input.logical_extent()?;
-    let mut output = exec.alloc::<Op::Output>(len);
-    transform_into(exec, input, op, output.slice_mut(..))?;
-    output.set_logical_extent(extent);
-    Ok(output)
-}
-
-pub(crate) fn map_preserving_extent<R, Input, Op>(
     exec: &Executor<R>,
     input: Input,
     op: Op,

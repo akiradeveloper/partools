@@ -1,5 +1,6 @@
 use cubecl::prelude::{CubeType, Runtime};
 
+use crate::api::iter::MStorageExtent;
 use crate::{Error, Executor, MAlloc, MFlag, MIter, MIterMut, MStorage, MVec};
 
 struct GatherOperation<'a, R: Runtime, Values, Indices> {
@@ -20,10 +21,10 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        crate::indexed::gather_direct(
+        crate::core::indexed::gather_direct(
             self.exec,
             crate::api::iter::lower::<R, _>(self.values),
             crate::api::iter::lower::<R, _>(self.indices),
@@ -42,7 +43,7 @@ struct GatherWhereOperation<'a, R: Runtime, Values, Indices, Stencil> {
 struct ApplyPermutationOperation<'a, R: Runtime, Input> {
     exec: &'a Executor<R>,
     input: Input,
-    indices: crate::Column<u32>,
+    indices: crate::core::read::Column<u32>,
     active_len: Option<&'a crate::DeviceVec<R, u32>>,
 }
 
@@ -57,16 +58,14 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        crate::indexed::IndexedCopyInput::indexed_copy_selected(
+        crate::core::indexed::PermutationCopyInput::permutation_copy(
             self.input,
             self.exec,
             self.indices,
-            None,
             self.active_len,
-            true,
             output,
         )
     }
@@ -75,7 +74,7 @@ where
 pub(crate) fn apply_permutation_into<R, Input, Output>(
     exec: &Executor<R>,
     input: Input,
-    indices: crate::Column<u32>,
+    indices: crate::core::read::Column<u32>,
     output: Output,
 ) -> Result<(), Error>
 where
@@ -94,7 +93,7 @@ where
 pub(crate) fn apply_permutation_prefix_into<R, Input, Output>(
     exec: &Executor<R>,
     input: Input,
-    indices: crate::Column<u32>,
+    indices: crate::core::read::Column<u32>,
     active_len: &crate::DeviceVec<R, u32>,
     output: Output,
 ) -> Result<(), Error>
@@ -124,31 +123,23 @@ where
 
     fn run<Output>(self, output: Output) -> Self::Result
     where
-        Item: crate::api::iter::KernelRow + crate::allocation::ScratchStorage<R>,
+        Item: crate::api::iter::KernelRow + crate::core::allocation::ScratchStorage<R>,
         Output: crate::api::iter::ConcreteOutput<R, Item>,
     {
-        let control = crate::selection::FlagInput::selected_control(
+        let control = crate::core::selection::FlagInput::selected_control(
             crate::api::iter::lower::<R, _>(self.stencil),
             self.exec,
         )?;
-        let scratch =
-            <Item as crate::allocation::ScratchStorage<R>>::alloc_scratch(self.exec, control.len());
-        crate::indexed::IndexedCopyInput::indexed_copy_selected(
+        crate::core::indexed::IndexedCopyInput::indexed_copy_selected(
             crate::api::iter::lower::<R, _>(self.values),
             self.exec,
             crate::api::iter::lower::<R, _>(self.indices),
-            Some(control.indices()),
+            Some(crate::core::indexed::IndexSelection::Routing {
+                control: &control,
+                retain_output_position: true,
+            }),
             Some(control.count()),
             true,
-            crate::RowStorage::write(&scratch),
-        )?;
-        crate::indexed::IndexedCopyInput::indexed_copy_selected(
-            crate::RowStorage::read(&scratch),
-            self.exec,
-            control.indices().column(),
-            None,
-            Some(control.count()),
-            false,
             output,
         )
     }
@@ -181,8 +172,10 @@ where
     Indices: MIter<R, Item = crate::MIndex>,
 {
     let len = indices.capacity()?;
-    let output = exec.alloc::<Item>(len);
+    let extent = indices.logical_extent()?;
+    let mut output = exec.alloc::<Item>(len);
     gather_into(exec, values, indices, output.slice_mut(..))?;
+    output.set_logical_extent(extent);
     Ok(output)
 }
 
@@ -294,8 +287,10 @@ where
     Item: MAlloc<R>,
 {
     let len = values.capacity()?;
-    let output = exec.alloc::<Item>(len);
+    let extent = values.logical_extent()?;
+    let mut output = exec.alloc::<Item>(len);
     reverse_into(exec, values, output.slice_mut(..))?;
+    output.set_logical_extent(extent);
     Ok(output)
 }
 

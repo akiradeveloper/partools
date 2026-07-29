@@ -78,3 +78,24 @@ fn flat_map_supports_multi_column_inputs_and_outputs() {
     assert_eq!(exec.to_host(&left).unwrap(), vec![2, 3, 1]);
     assert_eq!(exec.to_host(&right).unwrap(), vec![10_u64, 11, 30]);
 }
+
+#[test]
+fn flat_map_resolves_only_the_selected_parent_prefix() {
+    let exec = Executor::<WgpuRuntime>::new(WgpuDevice::DefaultDevice);
+    let counts = exec.to_device(&[2u32, 0, 1, 3]);
+    let values = exec.to_device(&[10u32, 20, 30, 40]);
+    for count in [0usize, 2, 3] {
+        let flags = exec.to_device(&(0..4).map(|i| u32::from(i < count)).collect::<Vec<_>>());
+        let selected = massively::vector::copy_where(
+            &exec,
+            zip2(counts.slice(..), values.slice(..)),
+            flags.slice(..),
+        )
+        .unwrap();
+        let expanded = flat_map(&exec, selected.slice(..), ExpandPair).unwrap();
+        let (left, right) = MStorage::into_columns(expanded);
+        let len = if count == 0 { 0 } else { count };
+        assert_eq!(exec.to_host(&left).unwrap(), [2u32, 3, 1][..len]);
+        assert_eq!(exec.to_host(&right).unwrap(), [10u64, 11, 30][..len]);
+    }
+}

@@ -1,6 +1,0 @@
-name = "massively-proof"
-version = "0.1.0"
-defaultTargets = ["MassivelyProof"]
-
-[[lean_lib]]
-name = "MassivelyProof"
